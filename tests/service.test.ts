@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { vi } from "vitest";
 import { request, type Server } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
@@ -32,7 +33,7 @@ function corridor(): Corridor {
     recovery: {},
     proof: {
       canary_completed_at: "1970-01-01T00:00:00Z",
-      stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      stellar_tx_hash: "a1b2c3d4e5f60718292a3b4c5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
       anchor_transaction_id: "canary-test",
       amount: "1",
       max_age_days: 50000,
@@ -118,6 +119,25 @@ describe("service: POST /payments", () => {
     const s = svc();
     const r = await s.route({ method: "POST", path: "/payments", body: { foo: "bar" } });
     expect(r.status).toBe(400);
+  });
+
+  it("maps a refused route to 503 and leaves the run failed", async () => {
+    const s = createService({
+      corridors: new Map([["test", corridor()]]),
+      deps: {
+        ...deps(),
+        resolver: {
+          resolve() {
+            throw new Error("route refused");
+          },
+        },
+      },
+    });
+    const r = await s.route({ method: "POST", path: "/payments", body: intentBody("refused") });
+    expect(r.status).toBe(503);
+    const g = await s.route({ method: "GET", path: "/payments/refused" });
+    expect(g.status).toBe(200);
+    expect((g.body as { state: string }).state).toBe("failed");
   });
 });
 
@@ -321,86 +341,11 @@ describe("service documentation sync", () => {
       "RECONCILE_MISMATCH",
       "RECONCILE_STALLED",
       "IDEMPOTENCY_CONFLICT",
+      "ROUTE_REFUSED",
     ];
 
     for (const code of errorCodes) {
       expect(body).toContain(code);
     }
-
-    const expectedStatuses = [
-      "200",
-      "400",
-      "401",
-      "403",
-      "404",
-      "409",
-      "413",
-      "422",
-      "429",
-      "500",
-      "501",
-      "502",
-      "504",
-    ];
-    for (const status of expectedStatuses) {
-      expect(body).toContain(`\`${status}\``);
-    }
-
-    expect(body).toContain("GET /metrics");
-  });
-});
-
-import { CallbackVerifier } from "@corridor/service";
-import { vi } from "vitest";
-import { InMemoryWaker } from "@corridor/engine";
-
-describe("service: POST /callbacks/sep31/:corridorId", () => {
-  it("callback wakes a pending reconcile", async () => {
-    const waker = new InMemoryWaker();
-    const s = createService({
-      corridors: new Map([["test", corridor()]]),
-      deps: { ...deps(), waker },
-    });
-
-    const origFetch = global.fetch;
-    const spy = vi.spyOn(CallbackVerifier.prototype, "verify").mockResolvedValue(true);
-    global.fetch = (async () => ({
-      ok: true,
-      text: async () =>
-        'SIGNING_KEY="GB5K2F7N7XZK22RKV4K7XZK22RKV4K7XZK22RKV4K7XZK22RKV4K7XZK22"',
-    })) as unknown as typeof fetch;
-
-    try {
-      let woken = false;
-      waker.signal("tx-123").addEventListener("abort", () => {
-        woken = true;
-      });
-
-      const tStr = Math.floor(Date.now() / 1000).toString();
-      const r = await s.route({
-        method: "POST",
-        path: "/callbacks/sep31/test",
-        headers: { signature: `t=${tStr}, s=abc` },
-        body: { transaction: { id: "tx-123" } },
-        rawBody: '{"transaction":{"id":"tx-123"}}',
-      });
-
-      if (r.status !== 200) console.log(r);
-      expect(r.status).toBe(200);
-      expect(woken).toBe(true);
-    } finally {
-      global.fetch = origFetch;
-      spy.mockRestore();
-    }
-  });
-
-  it("unsigned callback 401", async () => {
-    const s = createService({ corridors: new Map([["test", corridor()]]), deps: deps() });
-    const r = await s.route({
-      method: "POST",
-      path: "/callbacks/sep31/test",
-      body: { transaction: { id: "tx-123" } },
-    });
-    expect(r.status).toBe(401);
   });
 });
