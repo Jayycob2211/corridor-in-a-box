@@ -18,6 +18,7 @@ export const isErr = <T, E>(o: Outcome<T, E>): o is Err<E> => !o.ok;
 
 export type CorridorErrorCode =
   | "MANIFEST_INVALID"
+  | "CAPABILITY_MISMATCH"
   | "AMOUNT_INVALID"
   | "ENGINE_MISCONFIGURED"
   | "PRESETTLE_ANCHOR_DRIFT"

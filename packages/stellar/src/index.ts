@@ -1252,7 +1252,18 @@ export function destinationCheck(
         durationMs: Date.now() - start,
         ...partial,
       });
-      const destination = ctx.opened.depositAddress;
+      const destination =
+        ctx.opened.instructions?.kind === "stellar_payment"
+          ? ctx.opened.instructions.to
+          : ctx.opened.depositAddress;
+
+      if (!destination) {
+        return done({
+          passed: false,
+          code: "PRESETTLE_DESTINATION_UNSAFE",
+          detail: "no destination address provided in opened transaction instructions",
+        });
+      }
 
       if (destination === signerPublicKey) {
         return done({

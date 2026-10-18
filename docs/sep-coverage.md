@@ -65,12 +65,15 @@ another transfer SEP is a new adapter, not an engine change:
 
 - **SEP-6** maps cleanly onto the same five verbs — `openTransaction` becomes a
   SEP-6 `POST /transactions/withdraw` (or `/deposit`), `getTransaction` polls the
-  SEP-6 status. A `Sep6Adapter` alongside `Sep31Adapter` would be the bulk of it.
+  SEP-6 status. `@corridor/sep6` now provides the adapter and its `GET /info`
+  discovery; the transfer verbs land in their own issues.
 - **SEP-24** is the awkward one: its interactive webview needs a human, so it
   fits a _user-facing_ product, not an unattended corridor. If it were ever
   needed, the `open` step would return an `interactive_url` the caller must drive,
   and the engine would park in a `pending_user` state — a genuine engine change,
-  which is why it is out of scope today.
+  which is why it is out of scope today. See
+  [docs/protocols/sep24.md](./protocols/sep24.md) for a full breakdown of the
+  SEP-24 interactive lifecycle, state-machine implications, and options considered.
 
 ## External quotes (`fx.quote_source: external`)
 

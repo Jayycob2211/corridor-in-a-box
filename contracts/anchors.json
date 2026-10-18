@@ -19,7 +19,82 @@
     "hold records in the registry. They are listed here because a record nobody",
     "refreshes decays into a stale row the scheduled job will never touch — the",
     "registry's whole claim is that staleness is visible AND fixable, so every",
-    "domain it holds belongs in this list."
+    "domain it holds belongs in this list.",
+    "BlindPay appears in the Stellar Anchor Directory for Argentina, Brazil,",
+    "Colombia, Mexico, and the United States, but the entry publishes no website",
+    "or toml_file. BlindPay's official home domain is blindpay.com; its",
+    "https://blindpay.com/.well-known/stellar.toml returned HTTP 403 on",
+    "2026-10-16, so no SEP-31 receive capability was verified and no corridor",
+    "manifest was added. This records an inconclusive probe, not a claim of",
+    "SEP-6 or SEP-24 support.",
+    "",
+    "mykobo.co is a real EUR anchor (MyKobo, Warsaw, Poland), listed in the Stellar",
+    "Anchor Directory. Its stellar.toml advertises SEP-6, SEP-24 and SEP-31, but the",
+    "host it publishes for those APIs (stellar.mykobo.co) does not resolve, so the",
+    "SEP-10 and SEP-31 probes fail and no corridor manifest is written. Probed",
+    "2026-10-16; MyKobo's status page listed the Anchor service as down at the time.",
+    "",
+    "Each entry in `anchors` records curator-declared context (name, ISO 3166-1",
+    "alpha-2 countries, kind, directory/manifest source, and date added). Countries",
+    "and `kind` are curator-declared metadata, NOT attested facts; `domains` mirrors",
+    "`anchors[].domain` in order."
   ],
-  "domains": ["testanchor.stellar.org", "cowrie.exchange", "stellar.org", "lobstr.co"]
+  "domains": [
+    "testanchor.stellar.org",
+    "cowrie.exchange",
+    "stellar.org",
+    "lobstr.co",
+    "blindpay.com",
+    "mykobo.co"
+  ],
+  "anchors": [
+    {
+      "domain": "testanchor.stellar.org",
+      "name": "Stellar Development Foundation Test Anchor",
+      "countries": ["US"],
+      "kind": "test",
+      "source": "https://testanchor.stellar.org/.well-known/stellar.toml",
+      "added": "2026-08-11"
+    },
+    {
+      "domain": "cowrie.exchange",
+      "name": "Cowrie Exchange",
+      "countries": ["NG"],
+      "kind": "offramp",
+      "source": "corridors/ng-cowrie.corridor.yaml",
+      "added": "2026-08-11"
+    },
+    {
+      "domain": "stellar.org",
+      "name": "Stellar Development Foundation",
+      "countries": ["US"],
+      "kind": "other",
+      "source": "https://stellar.org/.well-known/stellar.toml",
+      "added": "2026-08-11"
+    },
+    {
+      "domain": "lobstr.co",
+      "name": "LOBSTR",
+      "countries": [],
+      "kind": "other",
+      "source": "https://lobstr.co/.well-known/stellar.toml",
+      "added": "2026-08-11"
+    },
+    {
+      "domain": "blindpay.com",
+      "name": "BlindPay",
+      "countries": ["AR", "BR", "CO", "MX", "US"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org",
+      "added": "2026-10-16"
+    },
+    {
+      "domain": "mykobo.co",
+      "name": "MyKobo",
+      "countries": ["PL"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=MyKobo",
+      "added": "2026-10-16"
+    }
+  ]
 }

@@ -27,7 +27,7 @@ Keep the engine as the middleman and state-machine owner, but make the protocol 
 | settle      | Operator submits Stellar payment to the SEP-31 deposit address with exact memo | Adapter reports whether settlement is on-chain or off-chain; don't assume a SEP-31 deposit address | `SettlementStrategy` chooses on-chain transfer or adapter-reported settlement | Excluded: user-controlled interactive session is not a deterministic engine step            |
 | reconcile   | Poll SEP-31 `GET /transactions/:id` to terminal status                         | Poll SEP-6 `GET /transaction` and map status                                                       | Adapter polls its transaction endpoint and maps statuses                      | SEP-24 status polling follows an interactive flow and is not suitable for unattended runs   |
 
-SEP-24 is excluded from unattended runs because it is explicitly a hosted, interactive deposit/withdrawal flow; a future operator-driven session integration can be designed separately. SEP-6 and SEP-24 transaction monitoring may use Stellar transaction details and memos; those assumptions do not make a claimable balance interchangeable with SEP-31's memo-correlated deposit.
+SEP-24 is excluded from unattended runs because it is explicitly a hosted, interactive deposit/withdrawal flow (see [../protocols/sep24.md](../protocols/sep24.md) for the detailed protocol analysis); a future operator-driven session integration can be designed separately. SEP-6 and SEP-24 transaction monitoring may use Stellar transaction details and memos; those assumptions do not make a claimable balance interchangeable with SEP-31's memo-correlated deposit.
 
 ## Manifest shape
 

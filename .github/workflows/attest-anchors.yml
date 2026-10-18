@@ -58,7 +58,7 @@ jobs:
         run: |
           domains="$DOMAINS"
           if [ -z "$domains" ]; then
-            domains=$(node -p "require('./contracts/anchors.json').domains.join(' ')")
+            domains=$(node ./node_modules/tsx/dist/cli.mjs -e "import { loadFleet } from './packages/probe/src/fleet.ts'; console.log(loadFleet().domains.join(' '));")
           fi
           echo "probing: $domains"
           for d in $domains; do

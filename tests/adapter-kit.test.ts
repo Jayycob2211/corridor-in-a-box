@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { conformanceSuite, createMockAdapter } from "@corridor/adapter-kit";
+import { conformanceSuite, createMockAdapter, toLegacy } from "@corridor/adapter-kit";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import type { PaymentIntent } from "@corridor/types";
 
@@ -230,5 +230,48 @@ describe("createMockAdapter", () => {
       status: "refunded",
       refundId: "ref_123",
     });
+  });
+
+  it("openTransaction: returns instructions with kind 'stellar_payment'", async () => {
+    const adapter = createMockAdapter();
+    const q = await adapter.requestQuote(intent, corridor());
+    if (!q.ok) throw new Error("quote failed");
+    const r = await adapter.openTransaction(intent, q.value, corridor());
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.instructions.kind).toBe("stellar_payment");
+    if (r.value.instructions.kind === "stellar_payment") {
+      expect(r.value.instructions.to).toBe(r.value.depositAddress);
+      expect(r.value.instructions.memo).toBe(r.value.memo);
+    }
+  });
+
+  it("toLegacy: extracts legacy fields from stellar_payment instructions", () => {
+    const legacy = toLegacy({
+      transactionId: "tx_1",
+      instructions: {
+        kind: "stellar_payment",
+        to: "GDESTINATION",
+        memo: "12345",
+        memoType: "id",
+      },
+    });
+    expect(legacy).toEqual({
+      depositAddress: "GDESTINATION",
+      memo: "12345",
+      memoType: "id",
+    });
+  });
+
+  it("toLegacy: returns empty object for non-stellar instruction kinds when no legacy fallback", () => {
+    const legacy = toLegacy({
+      transactionId: "tx_2",
+      instructions: {
+        kind: "claimable_balance",
+        claimant: "GCLAIMANT",
+      },
+    });
+    expect(legacy.depositAddress).toBeUndefined();
+    expect(legacy.memo).toBeUndefined();
   });
 });

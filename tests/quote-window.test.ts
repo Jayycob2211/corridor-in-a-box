@@ -54,6 +54,12 @@ function ctxWith(quote: Partial<Quote>, marginSeconds = 45): GateContext {
     },
     opened: {
       transactionId: "tx-1",
+      instructions: {
+        kind: "stellar_payment",
+        to: "GDEST",
+        memo: "memo123",
+        memoType: "text",
+      },
       depositAddress: "GDEST",
       memo: "memo123",
       memoType: "text",

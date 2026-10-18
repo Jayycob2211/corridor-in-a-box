@@ -17,7 +17,14 @@ import {
   type PaymentIntent,
 } from "@corridor/types";
 import type { RouteResolver } from "@corridor/router";
-import { ExternalQuoteProvider, type ExternalQuoteFn } from "@corridor/adapter-kit";
+import {
+  AdapterQuoteProvider,
+  ExternalQuoteProvider,
+  toLegacy,
+  type ExternalQuoteFn,
+  type OpenTransaction,
+  type QuoteProvider,
+} from "@corridor/adapter-kit";
 import { canTransition, isTerminal, type CorridorState } from "./state";
 import {
   InMemoryIdempotencyStore,
@@ -48,6 +55,7 @@ import {
 } from "./verbs";
 import type { AnchorAdapter, TransactionStatus } from "@corridor/adapter-kit";
 import { defaultStrategies } from "./ports";
+import { checkCompatibility } from "./compat";
 import {
   noopMetrics,
   silentLogger,
@@ -134,6 +142,12 @@ export interface EngineDeps {
    * for those corridors; the engine never makes a SEP-38 call for them.
    */
   externalQuote?: ExternalQuoteFn;
+  /**
+   * Optional custom quote provider or factory. Overrides the default provider
+   * derived from the corridor manifest and adapter capabilities.
+   */
+  quoteProvider?:
+    QuoteProvider | ((corridor: Corridor, adapter: AnchorAdapter) => QuoteProvider);
   /**
    * Explicit escape hatch skipping pre-settle verification. When true, execute() bypasses gate
    * evaluation while recording `gate.skipped` in the audit log and emitting a warning.
@@ -304,7 +318,70 @@ export async function execute(
 
 // --- shared context for the drive/resume pair ---
 
-interface Ctx {
+type Err = { ok: false; error: CorridorError };
+
+function settlementRequestFor(
+  opened:
+    | OpenTransaction
+    | { depositAddress?: string; memo?: string; memoType?: "text" | "hash" | "id" },
+  q: { sourceAmount: { amount: string } },
+  corridor: Corridor,
+): SettlementRequest {
+  const legacy = "instructions" in opened ? toLegacy(opened) : opened;
+  return {
+    to: legacy.depositAddress ?? "",
+    memo: legacy.memo,
+    memoType: legacy.memoType,
+    amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
+    corridor,
+  };
+}
+
+/** Run the optional chain verifier; a no-op success when none is configured. */
+async function verifyOnChain(
+  deps: EngineDeps,
+  ref: SettlementRef,
+  req: SettlementRequest,
+): Promise<Outcome<void>> {
+  if (!deps.chainVerifier) return ok(undefined);
+  const r = await deps.chainVerifier(ref, req);
+  if (r.ok) return r;
+  // Never retry: the payment is already on the chain, resubmitting would double it.
+  return fail(r.error.code, r.error.message, { retryable: false, cause: r.error.cause });
+}
+
+interface AdvanceMeta {
+  quoteFee?: Money;
+  networkFee?: string;
+  amountRefunded?: string;
+  amountFee?: string;
+  checks?: readonly CheckResult[];
+}
+
+interface RunContext {
+  advance(to: CorridorState, meta?: AdvanceMeta): Promise<Outcome<void>>;
+  die(error: CorridorError, checks?: readonly CheckResult[]): Promise<Err>;
+  finishFailure(error: CorridorError): Promise<Err>;
+  /**
+   * `breakerCause` is what the circuit breaker judges, when it differs from
+   * `error`: the refund port refusing, or a refund watch timing out, is a
+   * consequence, while the settlement/reconcile failure that put us in recovery
+   * is the lane-level signal. See LANE_FAILURE_CODES in breaker.ts.
+   */
+  holdAndStop(
+    error: CorridorError,
+    status?: TransactionStatus,
+    breakerCause?: CorridorError,
+  ): Promise<Err>;
+  /** Report a run that resolved outside this context (the resume handler). */
+  recordOutcome: RecordOutcome;
+}
+
+interface RunContextInit {
+  run: StoredRun;
+  trail: CorridorState[];
+  corridor: Corridor;
+  deps: EngineDeps;
   store: IdempotencyStore;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -594,7 +671,7 @@ function isCorridorError(e: unknown): e is CorridorError {
     e !== null &&
     typeof (e as CorridorError).code === "string" &&
     typeof (e as CorridorError).message === "string"
-);
+  );
 }
 
 function meteredHealth(deps: EngineDeps): CorridorHealthStore | undefined {

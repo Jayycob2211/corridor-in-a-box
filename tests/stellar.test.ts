@@ -913,6 +913,12 @@ describe("balanceCheck gate check (chain.balance)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: {
+          kind: "stellar_payment",
+          to: Keypair.random().publicKey(),
+          memo: "memo123",
+          memoType: "text",
+        },
         depositAddress: Keypair.random().publicKey(),
         memo: "memo123",
         memoType: "text",
@@ -1409,6 +1415,12 @@ describe("destinationCheck gate check (chain.destination)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: {
+          kind: "stellar_payment",
+          to: opts.destination ?? DEST,
+          memo: "memo123",
+          memoType: "text",
+        },
         depositAddress: opts.destination ?? DEST,
         memo: "memo123",
         memoType: "text",

@@ -10,6 +10,7 @@
   },
   "main": "./src/index.ts",
   "dependencies": {
+    "@corridor/probe": "workspace:*",
     "@corridor/types": "workspace:*",
     "zod": "^4.6.5",
     "yaml": "^2.9.1"

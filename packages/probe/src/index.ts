@@ -20,6 +20,15 @@ import { isSafeUrl } from "./url-safety";
 
 export { tomlHash } from "./toml-hash";
 export { isSafeUrl } from "./url-safety";
+export {
+  ANCHOR_KINDS,
+  isValidAnchorDomain,
+  loadFleet,
+  parseFleet,
+  type AnchorEntry,
+  type AnchorFleet,
+  type AnchorKind,
+} from "./fleet";
 
 /** SEP numbers in registry bit order. Must match SEP_NUMBERS in contracts/registry. */
 export const SEP_NUMBERS = [1, 6, 10, 12, 24, 31, 38] as const;
@@ -64,6 +73,8 @@ export interface ProbeResult {
   readonly tomlHash: string;
   /** Per-probe detail, in the order probes were attempted. */
   readonly outcomes: readonly ProbeOutcome[];
+  /** Raw text of stellar.toml if successfully fetched. */
+  readonly toml?: string;
 }
 
 export interface ProbeOptions {
@@ -79,7 +90,7 @@ export interface ProbeOptions {
 const ZERO_HASH = "0".repeat(64);
 
 /** Endpoint keys in a stellar.toml, and which SEP each one implies. */
-const TOML_ENDPOINTS: ReadonlyArray<{ key: string; sep: SepNumber }> = [
+export const TOML_ENDPOINTS: ReadonlyArray<{ key: string; sep: SepNumber }> = [
   { key: "TRANSFER_SERVER", sep: 6 },
   { key: "WEB_AUTH_ENDPOINT", sep: 10 },
   { key: "KYC_SERVER", sep: 12 },
@@ -269,7 +280,7 @@ export async function probeAnchor(
     }
   }
 
-  return { domain, seps, probesRun, probesPassed, tomlHash, outcomes };
+  return { domain, seps, probesRun, probesPassed, tomlHash, outcomes, toml };
 }
 
 export interface FormattedProbeResultJson {

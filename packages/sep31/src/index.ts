@@ -15,39 +15,30 @@
 
 import type { Sep31Anchor, Corridor } from "@corridor/manifest";
 import {
-  applyPrice,
   compareAmounts,
   fail,
   isValidAmount,
   ok,
-  subAmounts,
   type Money,
   type Outcome,
   type PaymentIntent,
 } from "@corridor/types";
-import type {
-  AdapterCapabilities,
-  AnchorAdapter,
-  KycResult,
-  OpenTransaction,
-  Quote,
-  RefundInfo,
-  RefundPayment,
-  RefundRef,
-  TransactionStatus,
+import {
+  type AdapterCapabilities,
+  type AnchorAdapter,
+  type DepositInstructions,
+  type KycResult,
+  type OpenTransaction,
+  type Quote,
+  type RefundInfo,
+  type RefundPayment,
+  type RefundRef,
+  Sep38QuoteProvider,
+  type TransactionStatus,
 } from "@corridor/adapter-kit";
 import type { CheckResult, GateCheck, GateContext } from "@corridor/engine";
 
 type FetchLike = typeof fetch;
-
-/**
- * How far `total_price × buy_amount` may drift from `sell_amount` before we
- * treat a firm quote as internally inconsistent. Anchors round to their payout
- * asset's precision (2dp for most fiat) while prices are quoted to 7+, so exact
- * equality is the wrong test — 0.1% absorbs legitimate rounding without hiding a
- * quote that simply does not add up.
- */
-const QUOTE_TOLERANCE = "0.001";
 
 /**
  * Signs a SEP-10 challenge. The concrete implementation (Keypair + Transaction
@@ -248,17 +239,7 @@ export function parseRefunds(
   };
 }
 
-/**
- * SEP-38 Asset Identification Format for the corridor's bridge asset:
- * `stellar:native` for XLM, `stellar:CODE:ISSUER` for everything else. Anchors
- * reject issuer-less Stellar asset ids ("sell_asset not found").
- */
-function sep38SellAsset(corridor: Corridor): string {
-  const code = corridor.settlement.bridge_asset;
-  return code.toUpperCase() === "XLM"
-    ? "stellar:native"
-    : `stellar:${code}:${corridor.settlement.asset_issuer}`;
-}
+export { sep38SellAsset } from "@corridor/adapter-kit";
 
 /** Decode a JWT's `exp` claim (epoch ms) without verifying it. */
 function jwtExpiryMs(token: string): number | undefined {
@@ -280,6 +261,7 @@ export class Sep31Adapter implements AnchorAdapter {
   private readonly fetchImpl: FetchLike;
   private readonly sep10?: Sep10Signer;
   private cachedToken?: { token: string; expMs: number };
+  private readonly sep38Provider: Sep38QuoteProvider;
 
   constructor(corridor: Corridor, opts: Sep31AdapterOptions = {}) {
     if (corridor.dest.protocol !== "sep31") {
@@ -292,6 +274,13 @@ export class Sep31Adapter implements AnchorAdapter {
     this.name = corridor.dest.name;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.sep10 = opts.sep10;
+    this.sep38Provider = new Sep38QuoteProvider({
+      context: "sep31",
+      fetchImpl: this.fetchImpl,
+      name: this.name,
+      authToken: () => this.authToken(),
+      quoteServer: () => this.anchor.endpoints.quote_server,
+    });
   }
 
   // SEP-10 challenge/response: GET a challenge transaction, sign it, POST it back
@@ -386,122 +375,7 @@ export class Sep31Adapter implements AnchorAdapter {
   async requestQuote(intent: PaymentIntent, corridor: Corridor): Promise<Outcome<Quote>> {
     const b = this.base(corridor);
     if (!b.ok) return b;
-    if (!b.value.sep38) {
-      return fail("QUOTE_UNAVAILABLE", `${this.name}: anchor exposes no SEP-38 quote server`);
-    }
-    const auth = await this.authToken();
-    if (!auth.ok) return auth;
-    try {
-      const res = await this.fetchImpl(`${b.value.sep38}/quote`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...this.authHeader(auth.value),
-        },
-        body: JSON.stringify({
-          // Required by SEP-38: the protocol the quote will be executed under.
-          context: "sep31",
-          sell_asset: sep38SellAsset(corridor),
-          buy_asset: this.anchor.asset,
-          sell_amount: intent.sourceAmount.amount,
-        }),
-      });
-      if (!res.ok) {
-        return fail("QUOTE_UNAVAILABLE", `${this.name}: quote HTTP ${res.status}`, {
-          retryable: res.status >= 500,
-        });
-      }
-      const j = (await res.json()) as {
-        id: string;
-        /** Conversion rate EXCLUDING fees. Not the rate the payment executes at. */
-        price: string;
-        /** sell_amount / buy_amount — the all-in rate, fees included. */
-        total_price?: string;
-        expires_at: string;
-        sell_amount: string;
-        buy_amount: string;
-        fee?: { total: string; asset: string };
-      };
-
-      // Honour the anchor's OWN sell_amount, not the amount we asked for. The
-      // anchor may adjust for fees, rounding or minimums, and the firm quote
-      // binds to its number — settling the requested amount instead means the
-      // payout will not match and reconcile fails only after the money has left.
-      const sellAmount = j.sell_amount ?? intent.sourceAmount.amount;
-      if (!isValidAmount(sellAmount)) {
-        return fail(
-          "QUOTE_UNAVAILABLE",
-          `${this.name}: quote sell_amount "${sellAmount}" is malformed`,
-        );
-      }
-
-      // Cross-check the anchor's arithmetic before trusting a firm quote.
-      //
-      // Get the SEP-38 semantics right, because they are easy to get wrong:
-      //   price        conversion rate EXCLUDING fees
-      //   total_price  sell_amount / buy_amount, i.e. the all-in rate
-      //   fee          charged in fee.asset, typically the sell side
-      // so the invariant that actually holds is
-      //   sell_amount ≈ total_price × buy_amount
-      // NOT `buy_amount ≈ price × sell_amount`, which is wrong twice over
-      // (inverted, and using the pre-fee rate). Against the Anchor Platform
-      // reference server: sell 10, fee 1.00, price 1.0500035,
-      // total_price 1.1666705555, buy 8.57 — and 1.1666705555 × 8.57 ≈ 10. ✓
-      //
-      // Only checkable when the anchor sends total_price; skip rather than guess.
-      if (j.total_price && isValidAmount(j.total_price) && isValidAmount(j.buy_amount)) {
-        const impliedSell = applyPrice(j.buy_amount, j.total_price);
-        if (impliedSell.ok) {
-          const drift = subAmounts(impliedSell.value, sellAmount);
-          const tolerance = applyPrice(sellAmount, QUOTE_TOLERANCE);
-          if (drift.ok && tolerance.ok) {
-            const abs = drift.value.startsWith("-") ? drift.value.slice(1) : drift.value;
-            const within = compareAmounts(abs, tolerance.value);
-            if (within.ok && within.value > 0) {
-              return fail(
-                "QUOTE_UNAVAILABLE",
-                `${this.name}: quote ${j.id} is internally inconsistent — ` +
-                  `total_price ${j.total_price} × buy_amount ${j.buy_amount} = ` +
-                  `${impliedSell.value}, but sell_amount is ${sellAmount}`,
-              );
-            }
-          }
-        }
-      }
-
-      // The fee has to be in exactly the asset we asked to sell: a SEP-38 asset id, issuer included
-      // (the same code from another issuer is a different asset). Anything else would change what
-      // must be sent, so the quote is refused until someone proves the semantics of that case.
-      let fee: Money | undefined;
-      if (j.fee) {
-        const sellAsset = sep38SellAsset(corridor);
-        if (j.fee.asset !== sellAsset) {
-          return fail(
-            "QUOTE_UNAVAILABLE",
-            `${this.name}: quote fee asset "${j.fee.asset}" does not match sell asset "${sellAsset}"`,
-          );
-        }
-        // A malformed total is dropped rather than guessed at.
-        if (isValidAmount(j.fee.total)) {
-          fee = { asset: intent.sourceAmount.asset, amount: j.fee.total };
-        }
-      }
-
-      return ok<Quote>({
-        id: j.id,
-        price: j.price,
-        expiresAt: Date.parse(j.expires_at),
-        sourceAmount: { asset: intent.sourceAmount.asset, amount: sellAmount },
-        destAmount: { asset: this.anchor.asset, amount: j.buy_amount },
-        ...(fee && { fee }),
-        firm: true,
-      });
-    } catch (cause) {
-      return fail("ANCHOR_UNAVAILABLE", `${this.name}: quote request failed`, {
-        retryable: true,
-        cause,
-      });
-    }
+    return this.sep38Provider.quote(intent, corridor);
   }
 
   /**
@@ -690,13 +564,23 @@ export class Sep31Adapter implements AnchorAdapter {
         stellar_memo?: string;
         stellar_memo_type?: string;
       };
+      const memoType = parseMemoType(j.stellar_memo_type);
+      const instructions: DepositInstructions = {
+        kind: "stellar_payment",
+        to: j.stellar_account_id,
+        memo: j.stellar_memo,
+        memoType,
+      };
       return ok<OpenTransaction>({
         transactionId: j.id,
+        instructions,
+        amountIn: {
+          asset: corridor.settlement.bridge_asset,
+          amount: quote.sourceAmount.amount,
+        },
         depositAddress: j.stellar_account_id,
         memo: j.stellar_memo,
-        // Carry the anchor's memo TYPE through. Assuming "text" corrupts a hash
-        // memo (32 bytes, over the 28-byte text cap) and the submit fails.
-        memoType: parseMemoType(j.stellar_memo_type),
+        memoType,
       });
     } catch (cause) {
       return fail("ANCHOR_UNAVAILABLE", `${this.name}: open-tx failed`, {

@@ -67,6 +67,9 @@ packages/
   attester/      attestation writer for the conformance registry
   sep31/         ONE generic adapter for any standards-compliant SEP-31
                  anchor (SEP-10 auth + SEP-12 KYC; crypto behind an injected signer)
+  sep6/          ONE generic adapter for any standards-compliant SEP-6
+                 anchor (GET /info discovery + capabilities; the transfer
+                 verbs land in their own issues)
   stellar/       the only package on the money path that touches the chain;
                  @stellar/stellar-sdk-backed settlement submitter + SEP-10 signer
   router/        RouteResolver seam — open interface + two resolvers (Static + Registry)
@@ -224,6 +227,7 @@ difference without trusting the writer to have pruned it.
 ```bash
 pnpm probe:anchor testanchor.stellar.org   # probe a live anchor, print the facts
 pnpm registry:read                         # read the registry via @corridor/registry
+pnpm registry:read --sep 24 --passed sep10_auth   # filter; --max-age and --json too
 cd contracts && cargo test                 # 21 contract tests
 ```
 

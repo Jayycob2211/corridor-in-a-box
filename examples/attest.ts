@@ -12,7 +12,7 @@
 
 import { readFileSync } from "node:fs";
 import { Keypair } from "@stellar/stellar-sdk";
-import { probeAnchor, decodeProbes, decodeSeps } from "@corridor/probe";
+import { probeAnchor, decodeProbes, decodeSeps, loadFleet } from "@corridor/probe";
 import { AnchorAttester, AttesterContractError } from "@corridor/attester";
 
 interface Deployments {
@@ -43,9 +43,7 @@ async function main(): Promise<void> {
   }
 
   const domains =
-    process.argv.slice(2).length > 0
-      ? process.argv.slice(2)
-      : load<{ domains: string[] }>("../contracts/anchors.json").domains;
+    process.argv.slice(2).length > 0 ? process.argv.slice(2) : loadFleet().domains;
 
   const attester = new AnchorAttester({
     rpcUrl: cfg.rpcUrl,

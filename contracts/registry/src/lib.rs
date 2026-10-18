@@ -120,11 +120,23 @@ const PROBE_MASK: u32 = (1u32 << PROBE_NAMES.len()) - 1;
 
 /// Emitted on every accepted attestation, so indexers and dashboards can follow
 /// the registry without polling every key.
+///
+/// ## Event Schema Version
+/// - **v1** (initial): topic `("attested", domain)`, data `{ attested_ledger }`.
+/// - **v2** (current): topic `("attested", domain)`, data `{ seps, toml_hash, probes_run, probes_passed, attested_ledger, attester }`.
+///   Indexers can distinguish v2 from v1 by inspecting the map keys in the event data body
+///   (v2 carries the full attestation payload alongside `attested_ledger`).
 #[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attested {
     #[topic]
     pub domain: String,
+    pub seps: u32,
+    pub toml_hash: BytesN<32>,
+    pub probes_run: u32,
+    pub probes_passed: u32,
     pub attested_ledger: u32,
+    pub attester: Address,
 }
 
 #[contract]
@@ -189,20 +201,26 @@ impl Registry {
             env.storage().instance().set(&DataKey::Domains, &domains);
         }
 
+        let attested_ledger = env.ledger().sequence();
         let record = AnchorRecord {
             domain: domain.clone(),
             seps,
-            toml_hash,
+            toml_hash: toml_hash.clone(),
             probes_run,
             probes_passed,
-            attested_ledger: env.ledger().sequence(),
-            attester,
+            attested_ledger,
+            attester: attester.clone(),
         };
         env.storage().persistent().set(&key, &record);
 
         Attested {
             domain,
-            attested_ledger: record.attested_ledger,
+            seps,
+            toml_hash,
+            probes_run,
+            probes_passed,
+            attested_ledger,
+            attester,
         }
         .publish(&env);
         Ok(())

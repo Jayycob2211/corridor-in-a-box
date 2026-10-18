@@ -12,15 +12,21 @@ import {
   isSettleableAmount,
   STROOP_SCALE,
 } from "@corridor/types";
-import type {
-  AnchorAdapter,
-  QuoteProvider,
-  KycResult,
-  OpenTransaction,
-  Quote,
-  TransactionStatus,
+import {
+  toLegacy,
+  type AnchorAdapter,
+  type QuoteProvider,
+  type KycResult,
+  type OpenTransaction,
+  type Quote,
+  type TransactionStatus,
 } from "@corridor/adapter-kit";
-import type { SettlementRef, SettlementRequest, SettlementStrategy } from "./ports";
+import type {
+  DepositInstructionsKind,
+  SettlementRef,
+  SettlementRequest,
+  SettlementStrategy,
+} from "./ports";
 import type { Logger, Metrics } from "./observability";
 
 // 1. QUOTE — SEP-38. Get a price and verify the firm-quote window hasn't already
@@ -81,10 +87,11 @@ export function buildSettlementRequest(
   q: Quote,
   corridor: Corridor,
 ): SettlementRequest {
+  const legacy = toLegacy(opened);
   return {
-    to: opened.depositAddress,
-    memo: opened.memo,
-    memoType: opened.memoType,
+    to: legacy.depositAddress ?? "",
+    memo: legacy.memo,
+    memoType: legacy.memoType,
     amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
     corridor,
     validUntil: q.firm ? q.expiresAt : undefined,
@@ -115,10 +122,7 @@ export function settleQuoteProblem(q: Quote, corridor: Corridor): string | null 
 
 // 3b. SETTLE — the native on-chain payment of the bridge asset to the anchor.
 //     Dispatches to the first strategy whose `kind` matches the deposit
-//     instructions kind on the opened transaction. Today only "stellar_payment"
-//     is issued by the adapters, so the dispatch always routes to
-//     StellarPaymentStrategy. When issue #183 lands and adapters return
-//     additional kinds, add a strategy — no engine changes required.
+//     instructions kind on the opened transaction (#183).
 //
 //     Unknown kind → non-retryable SETTLEMENT_FAILED so no money moves on an
 //     unhandled path.
@@ -131,10 +135,11 @@ export async function settle(
   // Refuse before anything is submitted: never relabel an asset or round an amount silently.
   const problem = settleQuoteProblem(q, corridor);
   if (problem) return fail("AMOUNT_INVALID", problem);
-  // The current OpenTransaction shape has a flat depositAddress field (pre-#183).
-  // We resolve the kind conservatively: if the adapter sets it explicitly we
-  // respect it; otherwise we assume stellar_payment (the only kind today).
-  const kind = (opened as { kind?: string }).kind ?? "stellar_payment";
+
+  const kind: DepositInstructionsKind =
+    opened.instructions?.kind ??
+    (opened as { kind?: DepositInstructionsKind }).kind ??
+    "stellar_payment";
   const strategy = strategies.find((s) => s.kind === kind);
   if (!strategy) {
     return fail(

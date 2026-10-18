@@ -7,11 +7,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added
+
+- `mykobo.co` joins the attester anchor list in `contracts/anchors.json`. Its `stellar.toml` advertises SEP-6, SEP-24 and SEP-31, but the host it publishes for those APIs (`stellar.mykobo.co`) does not resolve, so the SEP-10 and SEP-31 probes fail and no corridor manifest is written. The probe outcome is recorded in the file's `$comment` (#226).
+
+### Added — QuoteProvider abstraction: SEP-38, adapter-native, and external pricing (#189)
+
+- Introduces `Sep38QuoteProvider` and `AdapterQuoteProvider` implementing `QuoteProvider`.
+- Refactors `Sep31Adapter.requestQuote` to delegate to `Sep38QuoteProvider`.
+- Extends corridor manifest `fx.quote_source` enum with `"native"`.
+- Adds `EngineDeps.quoteProvider` allowing operators to inject custom quote providers or factories `(corridor, adapter) => QuoteProvider`.
+- Engine validates adapter capabilities when `quote_source: "native"` is configured and dispatches quoting to `AdapterQuoteProvider`.
+
+### Added — Engine: read adapter capabilities instead of assuming SEP-31 behaviour (#188)
+
+- Engine executes `checkCompatibility(corridor, caps, strategies)` before external adapter calls.
+- Adds `CAPABILITY_MISMATCH` to `CorridorErrorCode` (mapped to HTTP 422 in service layer and documented in API docs).
+- Fails execution with `CAPABILITY_MISMATCH` if corridor requires quotes (e.g. `sep38`) but adapter capabilities report `quotes: ["none"]`, or if adapter settlement capabilities are empty or have unsupported settlement kinds not covered by available settlement strategies.
+- Skips compliance / KYC step during execution and resume when adapter capabilities declare `kyc: "none"`.
+
+### Added — `OpenTransaction.instructions` discriminated union (#183)
+
+- Add `DepositInstructions` discriminated union (`stellar_payment`, `claimable_balance`, `adapter_settled`) to `@corridor/adapter-kit`.
+- Update `OpenTransaction` to carry `instructions: DepositInstructions` while retaining deprecated optional `depositAddress`, `memo`, and `memoType` fields and adding `toLegacy()` helper for single-release backward compatibility.
+- Update `Sep31Adapter` and `createMockAdapter` to return `instructions` with `kind: "stellar_payment"`.
+- Update `settle()` in `@corridor/engine` to switch on `instructions.kind` and fail closed (`SETTLEMENT_FAILED`, non-retryable) on unhandled instruction kinds before attempting payment submission.
+
 ### Added — `--json` flag to `pnpm probe:anchor` (#232)
 
 - Adds `--json` flag parsing to `examples/probe-anchor.ts` accepted in any argv position.
 - Suppresses banner and human logs when `--json` is supplied, streaming only the serialized JSON probe result to stdout.
 - Introduces `formatProbeResultJson` and `parseProbeArgs` in `@corridor/probe`, formatting raw bitmasks alongside decoded SEP numbers and executed/passed probe lists.
+
+### Added: SEP-6 adapter scaffold with GET /info discovery
+
+`@corridor/sep6` implements the receiving-side `AnchorAdapter` for SEP-6
+anchors. It parses `GET {transfer_server}/info` (the `withdraw` and
+`withdraw-exchange` sections), caches the result on the adapter instance, and
+derives `capabilities()` from it. The transfer verbs fail closed with
+`ANCHOR_UNAVAILABLE` until their issues land (#196, #197, #198). SEP-10 auth is
+deliberately not wired here; it waits on the shared client from #194.
 
 ### Fixed — a resumed recovery run reports its real cause to the circuit breaker
 

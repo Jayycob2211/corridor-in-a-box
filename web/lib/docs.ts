@@ -84,6 +84,7 @@ packages/
   manifest/      Zod schema for a corridor + loader
   adapter-kit/   AnchorAdapter port + conformance probes + mock adapter
   sep31/         ONE generic adapter (SEP-10 auth + SEP-12 KYC)
+  sep6/          ONE generic adapter (GET /info discovery + capabilities)
   stellar/       the only money-path package that touches the chain:
                  settlement submitter + SEP-10 signer
   router/        RouteResolver seam — open interface + static default
@@ -177,6 +178,7 @@ Body is a \`PaymentIntent\`:
 | \`409\` | \`KYC_REQUIRED\` | Customer KYC incomplete or customer action required |
 | \`413\` | \`payload too large\` | Request body exceeds \`maxBodyBytes\` cap (default 64 KiB) |
 | \`422\` | \`AMOUNT_INVALID\` | Amount is not a positive decimal or cannot be settled |
+| \`422\` | \`CAPABILITY_MISMATCH\` | Adapter capabilities do not match corridor manifest or settlement strategies |
 | \`422\` | \`MANIFEST_INVALID\` | Corridor manifest validation failed |
 | \`429\` | \`rate_limited\` | Token-bucket rate limit exceeded for client IP or API key |
 | \`500\` | \`SETTLEMENT_FAILED\` | On-chain Stellar payment transaction failed |

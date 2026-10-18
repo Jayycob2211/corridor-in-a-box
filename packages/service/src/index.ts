@@ -94,6 +94,7 @@ export interface RouteRequest {
 
 const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   MANIFEST_INVALID: 422,
+  CAPABILITY_MISMATCH: 422,
   AMOUNT_INVALID: 422,
   QUOTE_UNAVAILABLE: 502,
   QUOTE_EXPIRED: 409,

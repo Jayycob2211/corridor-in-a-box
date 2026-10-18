@@ -111,6 +111,7 @@ describe("shared wiring module (wire.ts)", () => {
       },
       opened: {
         transactionId: "tx-1",
+        instructions: { kind: "stellar_payment", to: "GDEP" },
         depositAddress: "GDEP",
       },
       now: Date.now(),

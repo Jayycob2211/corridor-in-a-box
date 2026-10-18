@@ -23,6 +23,12 @@ import {
   formatBreakerTable,
   parseBreakerArgs,
 } from "../packages/cli/src/breaker";
+import {
+  compareManifestToToml,
+  formatLintResult,
+  isPlaceholderDomain,
+  lintCorridor,
+} from "../packages/cli/src/lint";
 
 // packages/cli/src/index.ts calls process.exit(main(...)) at module top level
 // and has no vitest path alias, so importing it directly would kill the test
@@ -152,7 +158,7 @@ describe("corridor CLI", () => {
   it("prints usage and exits 2 with no args", () => {
     const r = run([]);
     expect(r.status).toBe(2);
-    expect(r.stderr).toContain("usage: corridor <validate|plan|canary>");
+    expect(r.stderr).toContain("usage: corridor <validate|plan|lint|canary|new>");
   });
 
   it("exits 2 on an unknown subcommand", () => {
@@ -868,5 +874,164 @@ describe("currentUser", () => {
     const u = currentUser({});
     expect(u.length).toBeGreaterThan(0);
     expect(u.trim()).toBe(u);
+  });
+});
+
+describe("corridor lint", () => {
+  const cowrieManifest = () => {
+    const loaded = loadCorridor(join(REPO_ROOT, "corridors/ng-cowrie.corridor.yaml"));
+    if (!loaded.ok) throw new Error("failed to load ng-cowrie.corridor.yaml");
+    return loaded.value;
+  };
+
+  it("matches when manifest endpoints agree with stellar.toml (normalising trailing slashes)", () => {
+    const toml = [
+      'DIRECT_PAYMENT_SERVER = "https://api.cowrie.exchange/sep31/direct/"',
+      'WEB_AUTH_ENDPOINT = "https://api.cowrie.exchange/web_auth"',
+      'KYC_SERVER = "https://api.cowrie.exchange/kyc/"',
+    ].join("\n");
+
+    const res = compareManifestToToml(cowrieManifest(), toml);
+    expect(res.ok).toBe(true);
+    expect(res.findings).toEqual([]);
+  });
+
+  it("accepts single-quoted values in stellar.toml (as used by cowrie.exchange)", () => {
+    const toml = [
+      "DIRECT_PAYMENT_SERVER = 'https://api.cowrie.exchange/sep31/direct'",
+      "WEB_AUTH_ENDPOINT = 'https://api.cowrie.exchange/web_auth'",
+      "KYC_SERVER = 'https://api.cowrie.exchange/kyc'",
+    ].join("\n");
+
+    const res = compareManifestToToml(cowrieManifest(), toml);
+    expect(res.ok).toBe(true);
+    expect(res.findings).toEqual([]);
+    expect(formatLintResult(res)).toContain(
+      "all manifest endpoints match published stellar.toml",
+    );
+  });
+
+  it("reports a mismatch when a manifest endpoint differs from the published stellar.toml", () => {
+    const toml = [
+      'DIRECT_PAYMENT_SERVER = "https://api.cowrie.exchange/v2/sep31"',
+      'WEB_AUTH_ENDPOINT = "https://api.cowrie.exchange/web_auth"',
+      'KYC_SERVER = "https://api.cowrie.exchange/kyc"',
+    ].join("\n");
+
+    const res = compareManifestToToml(cowrieManifest(), toml);
+    expect(res.ok).toBe(false);
+    expect(res.findings).toHaveLength(1);
+    expect(res.findings[0]).toMatchObject({
+      severity: "error",
+      kind: "value_mismatch",
+      field: "transfer_server_sep31",
+      tomlKey: "DIRECT_PAYMENT_SERVER",
+      manifestValue: "https://api.cowrie.exchange/sep31/direct",
+      tomlValue: "https://api.cowrie.exchange/v2/sep31",
+    });
+  });
+
+  it("reports an error when the manifest pins an endpoint whose key is absent in stellar.toml", () => {
+    const toml = [
+      'DIRECT_PAYMENT_SERVER = "https://api.cowrie.exchange/sep31/direct"',
+      'WEB_AUTH_ENDPOINT = "https://api.cowrie.exchange/web_auth"',
+      // KYC_SERVER missing
+    ].join("\n");
+
+    const res = compareManifestToToml(cowrieManifest(), toml);
+    expect(res.ok).toBe(false);
+    expect(res.findings).toHaveLength(1);
+    expect(res.findings[0]).toMatchObject({
+      severity: "error",
+      kind: "missing_in_toml",
+      field: "kyc_server",
+      tomlKey: "KYC_SERVER",
+      manifestValue: "https://api.cowrie.exchange/kyc",
+    });
+  });
+
+  it("emits a warning (without failing) when stellar.toml publishes an endpoint omitted by the manifest", () => {
+    const toml = [
+      'DIRECT_PAYMENT_SERVER = "https://api.cowrie.exchange/sep31/direct"',
+      'WEB_AUTH_ENDPOINT = "https://api.cowrie.exchange/web_auth"',
+      'KYC_SERVER = "https://api.cowrie.exchange/kyc"',
+      'ANCHOR_QUOTE_SERVER = "https://api.cowrie.exchange/sep38"',
+    ].join("\n");
+
+    const res = compareManifestToToml(cowrieManifest(), toml);
+    expect(res.ok).toBe(true);
+    expect(res.findings).toHaveLength(1);
+    expect(res.findings[0]).toMatchObject({
+      severity: "warning",
+      kind: "omitted_in_manifest",
+      field: "quote_server",
+      tomlKey: "ANCHOR_QUOTE_SERVER",
+      tomlValue: "https://api.cowrie.exchange/sep38",
+    });
+    expect(formatLintResult(res)).toContain("! warning:");
+  });
+
+  it("fetches stellar.toml via injected fetchImpl and reports mismatches", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request) => {
+      calls.push(String(url));
+      return new Response(
+        [
+          "DIRECT_PAYMENT_SERVER = 'https://api.cowrie.exchange/sep31/direct'",
+          "WEB_AUTH_ENDPOINT = 'https://api.cowrie.exchange/web_auth'",
+          "KYC_SERVER = 'https://api.cowrie.exchange/kyc-new'",
+        ].join("\n"),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const res = await lintCorridor(cowrieManifest(), { fetchImpl });
+    expect(calls).toEqual(["https://cowrie.exchange/.well-known/stellar.toml"]);
+    expect(res.ok).toBe(false);
+    expect(res.findings[0]?.kind).toBe("value_mismatch");
+  });
+
+  it("skips localhost and .invalid/.example placeholder domains without calling fetch", async () => {
+    expect(isPlaceholderDomain("localhost:8080")).toBe(true);
+    expect(isPlaceholderDomain("example-cn-anchor.invalid")).toBe(true);
+    expect(isPlaceholderDomain("anchor.example.mx")).toBe(true);
+    expect(isPlaceholderDomain("cowrie.exchange")).toBe(false);
+
+    const explodingFetch = (async () => {
+      throw new Error("fetch must not be called for placeholder domains");
+    }) as unknown as typeof fetch;
+
+    for (const path of [
+      "corridors/reference.corridor.yaml",
+      "corridors/mx-example.corridor.yaml",
+      "corridors/ng-cn.corridor.yaml",
+    ]) {
+      const loaded = loadCorridor(join(REPO_ROOT, path));
+      if (!loaded.ok) throw new Error(`failed to load ${path}`);
+      const res = await lintCorridor(loaded.value, { fetchImpl: explodingFetch });
+      expect(res.skipped).toBe(true);
+      expect(res.ok).toBe(true);
+      expect(formatLintResult(res)).toContain("skipped: placeholder domain");
+    }
+  });
+
+  it("CLI subcommand: prints skipped: placeholder domain and exits 0 for reference/template corridors", () => {
+    const r1 = run(["lint", "corridors/reference.corridor.yaml"]);
+    expect(r1.status).toBe(0);
+    expect(r1.stdout).toContain("skipped: placeholder domain");
+
+    const r2 = run(["lint", "corridors/mx-example.corridor.yaml"]);
+    expect(r2.status).toBe(0);
+    expect(r2.stdout).toContain("skipped: placeholder domain");
+
+    const r3 = run(["lint", "corridors/ng-cn.corridor.yaml"]);
+    expect(r3.status).toBe(0);
+    expect(r3.stdout).toContain("skipped: placeholder domain");
+  });
+
+  it("CLI subcommand: exits 2 when the file argument is missing", () => {
+    const r = run(["lint"]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("usage: corridor lint <file.corridor.yaml>");
   });
 });

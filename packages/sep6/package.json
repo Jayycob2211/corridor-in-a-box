@@ -1,0 +1,17 @@
+{
+  "name": "@corridor/sep6",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "dependencies": {
+    "@corridor/adapter-kit": "workspace:*",
+    "@corridor/manifest": "workspace:*",
+    "@corridor/types": "workspace:*"
+  }
+}

@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, BytesN, Env, Event as _, String,
+};
 
 /// Bit indices, mirroring SEP_NUMBERS / PROBE_NAMES. Spelled out here rather
 /// than imported so a silent reordering in lib.rs fails these tests loudly.
@@ -262,4 +265,39 @@ fn every_sep_combination_round_trips() {
         }
         assert_eq!(got.len(), expected_len, "mask {mask}: wrong count");
     }
+}
+
+#[test]
+fn emits_full_attested_event_payload() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(4_242);
+    let d = domain(&f.env);
+    let seps = SEP1 | SEP10 | SEP12 | SEP31 | SEP38;
+    let probes_run = PROBE_TOML | PROBE_SEP31_INFO;
+    let probes_passed = PROBE_TOML;
+    let toml_hash = hash(&f.env, 0xcd);
+
+    f.client.put_anchor(
+        &d,
+        &seps,
+        &toml_hash,
+        &probes_run,
+        &probes_passed,
+        &f.attester,
+    );
+
+    let all_events = f.env.events().all();
+    let events = all_events.events();
+    assert_eq!(events.len(), 1);
+    let expected = Attested {
+        domain: d,
+        seps,
+        toml_hash,
+        probes_run,
+        probes_passed,
+        attested_ledger: 4_242,
+        attester: f.attester.clone(),
+    }
+    .to_xdr(&f.env, &f.client.address);
+    assert_eq!(events[0], expected);
 }

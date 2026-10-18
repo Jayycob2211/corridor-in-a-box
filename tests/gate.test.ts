@@ -44,7 +44,11 @@ function ctx(): GateContext {
       destAmount: { asset: "ARS", amount: "100.00" },
       firm: true,
     },
-    opened: { transactionId: "tx-1", depositAddress: "GDEPOSIT" },
+    opened: {
+      transactionId: "tx-1",
+      instructions: { kind: "stellar_payment", to: "GDEPOSIT" },
+      depositAddress: "GDEPOSIT",
+    },
     now: Date.now(),
     attempt: 0,
   };
