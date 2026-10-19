@@ -18,6 +18,7 @@ export const isErr = <T, E>(o: Outcome<T, E>): o is Err<E> => !o.ok;
 
 export type CorridorErrorCode =
   | "MANIFEST_INVALID"
+  | "MANIFEST_CHANGED"
   | "CAPABILITY_MISMATCH"
   | "AMOUNT_INVALID"
   | "ENGINE_MISCONFIGURED"
@@ -55,7 +56,14 @@ export type CorridorErrorCode =
    * caller's fault and not retryable - retrying the same payment would fail
    * the same way until someone looks at why the lane stopped settling.
    */
-  | "CORRIDOR_HALTED";
+  | "CORRIDOR_HALTED"
+  /**
+   * Not a failure of the lane: a run started with `dryRun: true` passed every
+   * pre-settle gate check and stopped there, as asked, without submitting the
+   * settle payment. The run is persisted as `failed` so its key cannot later
+   * be reused to move money.
+   */
+  | "DRY_RUN_COMPLETE";
 
 /**
  * Returns true if the error code is a pre-settle gate check refusal.

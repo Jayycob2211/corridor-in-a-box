@@ -38,6 +38,8 @@ export interface Liveness {
   readonly verifiedAt?: string;
   readonly proof?: Proof;
   readonly warnings: readonly string[];
+  /** Steps not covered by endpoint verification (e.g. quote when quote_source=external). */
+  readonly gaps: readonly string[];
 }
 
 /** Human-readable label for each state. Shared so the CLI and the web app can
@@ -51,6 +53,7 @@ export const LIVENESS_LABEL: Record<LivenessState, string> = {
 
 export function liveness(c: Corridor, now: Date = new Date()): Liveness {
   const warnings: string[] = [];
+  const gaps: string[] = [];
   const endpoints = c.dest.endpoints;
   const verifiedAt = endpoints.endpoints_verified_at;
   const sep31Server =
@@ -74,6 +77,13 @@ export function liveness(c: Corridor, now: Date = new Date()): Liveness {
   if (c.fx.quote_source === "sep38" && !quoteServer) {
     warnings.push(
       "fx.quote_source=sep38 but dest exposes no SEP-38 quote server — quotes will fail.",
+    );
+  }
+  if (c.fx.quote_source === "external") {
+    gaps.push("quote");
+    warnings.push(
+      "fx.quote_source=external requires an external quote provider to be wired by the operator; " +
+        "it is not covered by endpoints_verified_at.",
     );
   }
   if (!kycServer) {
@@ -139,5 +149,6 @@ export function liveness(c: Corridor, now: Date = new Date()): Liveness {
     verifiedAt,
     proof,
     warnings,
+    gaps,
   };
 }

@@ -21,6 +21,7 @@ import {
   createChainVerifier,
   verifySettlementFacts,
   LocalKeypairSigner,
+  StellarClaimableBalanceStrategy,
   StellarSep10Signer,
   StellarSettlementSubmitter,
   type AccountFacts,
@@ -412,6 +413,243 @@ describe("StellarSettlementSubmitter.fee", () => {
           fee: "not-a-number",
         }),
     ).toThrow(/invalid `fee`/);
+  });
+});
+
+describe("StellarClaimableBalanceStrategy", () => {
+  it("exposes kind claimable_balance", () => {
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: fakeServer({ submitTransaction: async () => ({}) }),
+    });
+    expect(strat.kind).toBe("claimable_balance");
+  });
+
+  it("builds a createClaimableBalance op with the right claimant and amount (unconditional predicate)", async () => {
+    let capturedTx: Transaction | FeeBumpTransaction | undefined;
+    const recipient = Keypair.random().publicKey();
+    const server = fakeServer({
+      submitTransaction: async (tx) => {
+        capturedTx = tx;
+        return { successful: true };
+      },
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 500 }),
+    });
+
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+    });
+
+    const req = {
+      ...testRequest(),
+      to: recipient,
+      amount: { asset: "USDC", amount: "25.5000000" },
+    };
+
+    const res = await strat.submit(req);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    expect(res.value.ledger).toBe(500);
+    expect(res.value.claimableBalanceId).toBeDefined();
+    expect(typeof res.value.claimableBalanceId).toBe("string");
+    expect(res.value.claimableBalanceId?.length).toBe(72);
+
+    expect(capturedTx).toBeDefined();
+    if (capturedTx && "operations" in capturedTx) {
+      expect(capturedTx.operations.length).toBe(1);
+      const op = capturedTx.operations[0];
+      expect(op.type).toBe("createClaimableBalance");
+      if (op.type === "createClaimableBalance") {
+        expect(op.amount).toBe("25.5000000");
+        expect(op.claimants.length).toBe(1);
+        expect(op.claimants[0].destination).toBe(recipient);
+        expect(op.claimants[0].predicate.type).toBe("claimPredicateUnconditional");
+      }
+    }
+  });
+
+  it("builds a createClaimableBalance op with relative time predicate when predicateSeconds is specified", async () => {
+    let capturedTx: Transaction | FeeBumpTransaction | undefined;
+    const recipient = Keypair.random().publicKey();
+    const server = fakeServer({
+      submitTransaction: async (tx) => {
+        capturedTx = tx;
+        return { successful: true };
+      },
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 600 }),
+    });
+
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      predicateSeconds: 3600,
+    });
+
+    const req = {
+      ...testRequest(),
+      to: recipient,
+      amount: { asset: "USDC", amount: "50" },
+    };
+
+    const res = await strat.submit(req);
+    expect(res.ok).toBe(true);
+    if (capturedTx && "operations" in capturedTx) {
+      const op = capturedTx.operations[0];
+      if (op.type === "createClaimableBalance") {
+        expect(op.claimants[0].predicate.type).toBe("claimPredicateBeforeRelativeTime");
+      }
+    }
+  });
+
+  it("settle() extracts claimant and predicate from context opened transaction", async () => {
+    let capturedTx: Transaction | FeeBumpTransaction | undefined;
+    const recipient = Keypair.random().publicKey();
+    const server = fakeServer({
+      submitTransaction: async (tx) => {
+        capturedTx = tx;
+        return { successful: true };
+      },
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 700 }),
+    });
+
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+    });
+
+    const opened = {
+      transactionId: "open-123",
+      depositAddress: recipient,
+      claimant: recipient,
+      predicateSeconds: 120,
+    };
+    const quote = {
+      id: "quote-123",
+      sourceAmount: { asset: "USDC", amount: "10" },
+      destinationAmount: { asset: "USDC", amount: "10" },
+      expiresAt: 2_000_000_000,
+    };
+
+    const res = await strat.settle({
+      opened: opened as unknown as import("@corridor/adapter-kit").OpenTransaction,
+      quote: quote as unknown as import("@corridor/adapter-kit").Quote,
+      corridor: testCorridor(),
+    });
+
+    expect(res.ok).toBe(true);
+    if (capturedTx && "operations" in capturedTx) {
+      const op = capturedTx.operations[0];
+      if (op.type === "createClaimableBalance") {
+        expect(op.claimants[0].destination).toBe(recipient);
+        expect(op.claimants[0].predicate.type).toBe("claimPredicateBeforeRelativeTime");
+      }
+    }
+  });
+
+  it("a confirmed Horizon rejection (TransactionFailedError) is retryable", async () => {
+    const rejection = new TransactionFailedError("tx failed", {
+      data: { extras: { result_codes: { transaction: "tx_bad_seq", operations: [] } } },
+    });
+    const server = fakeServer({
+      submitTransaction: async () => {
+        throw rejection;
+      },
+    });
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+    });
+
+    const r = await strat.submit(testRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      expect(r.error.retryable).toBe(true);
+    }
+  });
+
+  it("an ambiguous failure whose tx actually landed resolves to ok, not a retry", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => {
+        throw new Error("ECONNRESET");
+      },
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 8_888 }),
+    });
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      ...immediateClock(),
+    });
+
+    const r = await strat.submit(testRequest());
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.ledger).toBe(8_888);
+      expect(r.value.claimableBalanceId).toBeDefined();
+    }
+    expect(server.submitTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("an ambiguous failure that never resolves is non-retryable, not blindly retried", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => {
+        throw new Error("ECONNRESET");
+      },
+    });
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      confirmTimeoutMs: 3_000,
+      ...immediateClock(),
+    });
+
+    const r = await strat.submit(testRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_TIMEOUT");
+      expect(r.error.retryable).toBe(false);
+    }
+    expect(server.submitTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails with QUOTE_EXPIRED and never calls submitTransaction when validUntil is in the past", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => {
+        throw new Error("should not be called");
+      },
+    });
+
+    const fakeNow = 1_000_000_000;
+    const quoteExpiresAt = fakeNow - 1_000;
+    const strat = new StellarClaimableBalanceStrategy({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      now: () => fakeNow,
+    });
+
+    const req = {
+      ...testRequest(),
+      validUntil: quoteExpiresAt,
+    };
+
+    const res = await strat.submit(req);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("QUOTE_EXPIRED");
+      expect(res.error.retryable).toBe(false);
+    }
+    expect(server.submitTransaction).not.toHaveBeenCalled();
+    expect(server.loadAccount).not.toHaveBeenCalled();
   });
 });
 

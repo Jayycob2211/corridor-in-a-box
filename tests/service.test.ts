@@ -141,6 +141,175 @@ describe("service: POST /payments", () => {
   });
 });
 
+describe("service: strict payment body validation", () => {
+  // Table-driven: every rejection names the field that caused it. The old
+  // isPaymentBody() answered only "somewhere in here, one of six fields is not
+  // a string", which is useless to the caller and silent about everything
+  // else the engine was about to trust.
+  const full = () => intentBody();
+  const manyFields = Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`k${i}`, "v"]));
+
+  const rejections: Array<{ name: string; body: unknown; field: string }> = [
+    { name: "a non-object body", body: "payments", field: "<body>" },
+    { name: "a null body", body: null, field: "<body>" },
+    { name: "an array body", body: [intentBody()], field: "<body>" },
+    { name: "an empty body", body: {}, field: "idempotencyKey" },
+    {
+      name: "a non-string idempotencyKey",
+      body: { ...full(), idempotencyKey: 42 },
+      field: "idempotencyKey",
+    },
+    {
+      name: "an empty idempotencyKey",
+      body: { ...full(), idempotencyKey: "" },
+      field: "idempotencyKey",
+    },
+    {
+      name: "an idempotencyKey outside [A-Za-z0-9._:-]",
+      body: { ...full(), idempotencyKey: "key with spaces/slash" },
+      field: "idempotencyKey",
+    },
+    {
+      name: "an idempotencyKey over 128 characters",
+      body: { ...full(), idempotencyKey: "a".repeat(129) },
+      field: "idempotencyKey",
+    },
+    {
+      name: "a non-string corridorId",
+      body: { ...full(), corridorId: 7 },
+      field: "corridorId",
+    },
+    {
+      name: "an empty corridorId",
+      body: { ...full(), corridorId: "" },
+      field: "corridorId",
+    },
+    {
+      name: "a corridorId over 128 characters",
+      body: { ...full(), corridorId: "c".repeat(129) },
+      field: "corridorId",
+    },
+    { name: "an unknown top-level field", body: { ...full(), memo: "hi" }, field: "memo" },
+    {
+      name: "a missing sender",
+      body: { ...full(), sender: undefined },
+      field: "sender",
+    },
+    { name: "a non-object sender", body: { ...full(), sender: "s" }, field: "sender" },
+    { name: "a sender without id", body: { ...full(), sender: {} }, field: "sender.id" },
+    {
+      name: "a non-string sender.id",
+      body: { ...full(), sender: { id: 1 } },
+      field: "sender.id",
+    },
+    {
+      name: "an empty sender.id",
+      body: { ...full(), sender: { id: "" } },
+      field: "sender.id",
+    },
+    {
+      name: "a non-string sender.sep12Id",
+      body: { ...full(), sender: { id: "s", sep12Id: 42 } },
+      field: "sender.sep12Id",
+    },
+    {
+      name: "a non-string recipient.sep12Id",
+      body: { ...full(), recipient: { id: "r", sep12Id: { a: 1 } } },
+      field: "recipient.sep12Id",
+    },
+    {
+      name: "a non-string recipient.id",
+      body: { ...full(), recipient: { id: null } },
+      field: "recipient.id",
+    },
+    {
+      name: "an unknown field inside a party",
+      body: { ...full(), sender: { id: "s", nickname: "bud" } },
+      field: "sender.nickname",
+    },
+    {
+      name: "a missing sourceAmount",
+      body: { ...full(), sourceAmount: undefined },
+      field: "sourceAmount",
+    },
+    {
+      name: "a non-object sourceAmount",
+      body: { ...full(), sourceAmount: "100 USDC" },
+      field: "sourceAmount",
+    },
+    {
+      name: "a missing sourceAmount.asset",
+      body: { ...full(), sourceAmount: { amount: "100.00" } },
+      field: "sourceAmount.asset",
+    },
+    {
+      name: "an empty sourceAmount.asset",
+      body: { ...full(), sourceAmount: { asset: "", amount: "100.00" } },
+      field: "sourceAmount.asset",
+    },
+    {
+      name: "a non-string sourceAmount.amount",
+      body: { ...full(), sourceAmount: { asset: "USDC", amount: 100 } },
+      field: "sourceAmount.amount",
+    },
+    {
+      name: "an array destinationFields",
+      body: { ...full(), destinationFields: ["routing"] },
+      field: "destinationFields",
+    },
+    {
+      name: "a nested (non-flat) destinationFields value",
+      body: { ...full(), destinationFields: { routing: { n: "021000021" } } },
+      field: "destinationFields.routing",
+    },
+    {
+      name: "a destinationFields value over 256 characters",
+      body: { ...full(), destinationFields: { account: "x".repeat(257) } },
+      field: "destinationFields.account",
+    },
+    {
+      name: "destinationFields with more than 50 keys",
+      body: { ...full(), destinationFields: manyFields },
+      field: "destinationFields",
+    },
+  ];
+
+  it.each(rejections)("rejects $name with field $field", async ({ body, field }) => {
+    const r = await svc().route({ method: "POST", path: "/payments", body });
+    expect(r.status).toBe(400);
+    const out = r.body as { error: string; field: string; reason: string };
+    expect(out.error).toBe("invalid payment body");
+    expect(out.field).toBe(field);
+    expect(typeof out.reason).toBe("string");
+    expect(out.reason.length).toBeGreaterThan(0);
+  });
+
+  it("rejects an asset matching neither the corridor's source nor bridge asset", async () => {
+    const r = await svc().route({
+      method: "POST",
+      path: "/payments",
+      body: { ...intentBody(), sourceAmount: { asset: "BTC", amount: "1.00" } },
+    });
+    expect(r.status).toBe(422);
+    const out = r.body as { error: string; field: string };
+    expect(out.error).toBe("AMOUNT_INVALID");
+    expect(out.field).toBe("sourceAmount.asset");
+  });
+
+  it("still accepts a well-formed body end to end", async () => {
+    const r = await svc().route({
+      method: "POST",
+      path: "/payments",
+      body: {
+        ...intentBody("strict-ok"),
+        destinationFields: { receiver_routing_number: "021000021" },
+      },
+    });
+    expect(r.status).toBe(200);
+    expect((r.body as { state: string }).state).toBe("completed");
+  });
+});
+
 describe("service: GET /payments/:key", () => {
   it("returns the run state after a payment", async () => {
     const s = svc();
@@ -347,5 +516,166 @@ describe("service documentation sync", () => {
     for (const code of errorCodes) {
       expect(body).toContain(code);
     }
+  });
+});
+
+import { storeCheck } from "@corridor/service";
+
+describe("service: GET /readyz", () => {
+  it("returns 200 when all checks pass", async () => {
+    const s = svc({
+      readinessChecks: [
+        { name: "db", check: async () => {} },
+        { name: "cache", check: async () => {} },
+      ],
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(200);
+    expect((r.body as { status: string }).status).toBe("ok");
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([
+      { name: "db", ok: true },
+      { name: "cache", ok: true },
+    ]);
+  });
+
+  it("returns 503 when a check throws", async () => {
+    const s = svc({
+      readinessChecks: [
+        {
+          name: "db",
+          check: async () => {
+            throw new Error("connection refused");
+          },
+        },
+      ],
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    expect((r.body as { status: string }).status).toBe("degraded");
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([{ name: "db", ok: false }]);
+  });
+
+  it("returns 503 when a check times out", async () => {
+    const s = svc({
+      readinessChecks: [
+        // never resolves
+        { name: "slow", check: () => new Promise<void>(() => {}) },
+      ],
+      readinessTimeoutMs: 10,
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([{ name: "slow", ok: false }]);
+  });
+
+  it("returns 200 with no checks configured", async () => {
+    const r = await svc().route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(200);
+  });
+
+  it("returns 503 while draining even if all checks pass", async () => {
+    const s = svc({
+      readinessChecks: [{ name: "db", check: async () => {} }],
+    });
+    await s.drain();
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    expect((r.body as { status: string }).status).toBe("draining");
+  });
+
+  it("is public and unmetered (rate limit does not apply)", async () => {
+    const s = svc({
+      rateLimit: { capacity: 0, refillPerSec: 0 }, // would 429 everything if metered
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    // Should be 200, not 429
+    expect(r.status).toBe(200);
+  });
+
+  it("/healthz is unaffected by draining", async () => {
+    const s = svc();
+    await s.drain();
+    const r = await s.route({ method: "GET", path: "/healthz" });
+    expect(r.status).toBe(200);
+    expect((r.body as { status: string }).status).toBe("ok");
+  });
+});
+
+describe("service: drain()", () => {
+  it("new POST /payments return 503 draining after drain() is called", async () => {
+    const s = svc();
+    await s.drain();
+    const r = await s.route({ method: "POST", path: "/payments", body: intentBody() });
+    expect(r.status).toBe(503);
+    expect((r.body as { error: string }).error).toBe("draining");
+  });
+
+  it("in-flight execute() completes after drain() is called", async () => {
+    const s = createService({
+      corridors: new Map([["test", corridor()]]),
+      deps: {
+        ...deps(),
+        // Fast adapter — no real sleep needed; just verifies tracking logic
+        sleep: async () => {},
+      },
+    });
+
+    // Start a payment
+    const paymentPromise = s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("inflight-1"),
+    });
+
+    // Call drain while payment is still running
+    const drainPromise = s.drain();
+
+    // New payments should be rejected
+    const blockedR = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("inflight-2"),
+    });
+    expect(blockedR.status).toBe(503);
+
+    // Original payment still finishes
+    const result = await paymentPromise;
+    expect(result.status).toBe(200);
+
+    // drain() resolves once in-flight work is done
+    await drainPromise;
+
+    // Nothing is left running, so a grace-timer log would list no keys.
+    expect(s.inFlightKeys()).toEqual([]);
+  });
+
+  it("drain() resolves immediately when no payments are in-flight", async () => {
+    const s = svc();
+    // No payments started — drain should resolve right away
+    await expect(s.drain()).resolves.toBeUndefined();
+  });
+});
+
+describe("service: storeCheck helper", () => {
+  it("passes when ping resolves", async () => {
+    const check = storeCheck({ ping: async () => {} });
+    expect(check.name).toBe("store");
+    await expect(check.check()).resolves.toBeUndefined();
+  });
+
+  it("throws when ping rejects", async () => {
+    const check = storeCheck(
+      {
+        ping: async () => {
+          throw new Error("db down");
+        },
+      },
+      "pg",
+    );
+    expect(check.name).toBe("pg");
+    await expect(check.check()).rejects.toThrow("db down");
   });
 });

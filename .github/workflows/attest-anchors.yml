@@ -14,6 +14,13 @@
 # it just cannot write them — so the probe path stays continuously exercised
 # even before a signing key is configured, and the log says plainly which mode
 # it ran in.
+#
+# On scheduled runs the last step is `pnpm registry:staleness`
+# (examples/check-staleness.ts). It reads every domain in contracts/anchors.json
+# back from the registry and FAILS the run, with a ::error:: per domain, if one
+# was never attested or was last attested more than MAX_STALENESS_LEDGERS ago
+# (default ~2 days). That catches the case the secret check cannot: a secret
+# that is set but whose attestations keep failing or being skipped.
 name: attest-anchors
 on:
   schedule:
@@ -58,18 +65,34 @@ jobs:
         run: |
           domains="$DOMAINS"
           if [ -z "$domains" ]; then
-            domains=$(node ./node_modules/tsx/dist/cli.mjs -e "import { loadFleet } from './packages/probe/src/fleet.ts'; console.log(loadFleet().domains.join(' '));")
+            pnpm sweep:anchors --out sweep/
+          else
+            pnpm sweep:anchors --out sweep/ $domains
           fi
-          echo "probing: $domains"
-          for d in $domains; do
-            pnpm probe:anchor "$d"
-          done
+
+      # The step summary and the artifact are published even when a probe step
+      # failed, so the run page still shows what was found. `sweep.json` in the
+      # artifact is exactly what the submit step attests: one observation per
+      # domain, not a second probe.
+      - name: Publish sweep summary
+        if: always()
+        run: |
+          if [ -f sweep/sweep.md ]; then
+            cat sweep/sweep.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload sweep artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anchor-sweep-${{ github.run_id }}
+          path: sweep/
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Submit attestations
         if: ${{ env.ATTESTER_SECRET != '' }}
-        env:
-          DOMAINS: ${{ inputs.domains }}
-        run: pnpm attest $DOMAINS
+        run: pnpm attest --from sweep/sweep.json
 
       # Unset secret on a MANUAL run is a fair state — someone is exercising the
       # probe path on purpose. Unset on the SCHEDULE is not: the only reason
@@ -92,3 +115,7 @@ jobs:
           echo "::warning::ATTESTER_SECRET is not set — probes ran but nothing was" \
                "written on chain. Set the secret to an enrolled attester key to" \
                "keep the registry fresh."
+
+      - name: Verify registry freshness
+        if: ${{ github.event_name == 'schedule' }}
+        run: pnpm registry:staleness

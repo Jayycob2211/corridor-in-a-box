@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { conformanceSuite, createMockAdapter, toLegacy } from "@corridor/adapter-kit";
+import {
+  conformanceSuite,
+  createMockAdapter,
+  runConformance,
+  toLegacy,
+  type AnchorAdapter,
+} from "@corridor/adapter-kit";
+import { Sep31Adapter } from "@corridor/sep31";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import type { PaymentIntent } from "@corridor/types";
+import { expectConformance } from "./helpers/conformance";
 
 function corridor(): Corridor {
   const r = parseCorridor({
@@ -232,6 +240,34 @@ describe("createMockAdapter", () => {
     });
   });
 
+  it("capabilities: mock adapter returns default and honors override (#187)", () => {
+    const def = createMockAdapter();
+    expect(def.capabilities()).toEqual({
+      protocol: "mock",
+      quotes: ["sep38_firm"],
+      kyc: "sep12",
+      settlement: ["stellar_payment"],
+      refunds: "request",
+      callbacks: false,
+    });
+
+    const overridden = createMockAdapter({
+      capabilities: {
+        protocol: "custom-mock",
+        quotes: ["native"],
+        callbacks: true,
+      },
+    });
+    expect(overridden.capabilities()).toEqual({
+      protocol: "custom-mock",
+      quotes: ["native"],
+      kyc: "sep12",
+      settlement: ["stellar_payment"],
+      refunds: "request",
+      callbacks: true,
+    });
+  });
+
   it("openTransaction: returns instructions with kind 'stellar_payment'", async () => {
     const adapter = createMockAdapter();
     const q = await adapter.requestQuote(intent, corridor());
@@ -273,5 +309,122 @@ describe("createMockAdapter", () => {
     });
     expect(legacy.depositAddress).toBeUndefined();
     expect(legacy.memo).toBeUndefined();
+  });
+});
+
+describe("runConformance harness (#199)", () => {
+  it("passes for createMockAdapter()", async () => {
+    const adapter = createMockAdapter();
+    const report = await runConformance(
+      adapter,
+      { intent, corridor: corridor() },
+      {
+        allowNetworkWrites: true,
+      },
+    );
+    expectConformance(report);
+  });
+
+  it("passes for Sep31Adapter with mock fetch", async () => {
+    const mockFetch = (async (input: string | URL) => {
+      const url = input.toString();
+      if (url.includes("/sep31/info")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            receive: { ARS: { min_amount: "1", max_amount: "1000" } },
+          }),
+        };
+      }
+      if (url.includes("/sep12/customer")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status: "ACCEPTED" }),
+        };
+      }
+      if (url.includes("/sep38/quote")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: "q_1",
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            price: "1.00",
+            total_price: "1.00",
+            sell_amount: "100",
+            buy_amount: "100",
+          }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+
+    const sepCorridor = parseCorridor({
+      id: "sep31-test",
+      source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
+      dest: {
+        name: "D",
+        asset: "iso4217:ARS",
+        protocol: "sep31",
+        endpoints: {
+          home_domain: "d.example",
+          transfer_server_sep31: "https://d.example/sep31",
+          kyc_server: "https://d.example/sep12",
+          quote_server: "https://d.example/sep38",
+        },
+      },
+      fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
+      compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
+      settlement: { network: "public", asset_issuer: "GISSUER" },
+      recovery: {},
+    });
+    if (!sepCorridor.ok) throw new Error("sepCorridor invalid");
+
+    const sep31 = new Sep31Adapter(sepCorridor.value, { fetchImpl: mockFetch });
+
+    const report = await runConformance(sep31, { intent, corridor: sepCorridor.value });
+    expectConformance(report);
+  });
+
+  it("a deliberately broken mock (throws in getTransaction) fails the right probe", async () => {
+    const broken = createMockAdapter();
+    const adapterWithThrow: AnchorAdapter = {
+      ...broken,
+      async getTransaction() {
+        throw new Error("unexpected unhandled database failure");
+      },
+    };
+
+    const report = await runConformance(adapterWithThrow, { intent, corridor: corridor() });
+    expect(report.passed).toBe(false);
+    const probe = report.results.find(
+      (r) => r.name === "getTransaction handles unknown id without throw",
+    );
+    expect(probe).toBeDefined();
+    expect(probe?.passed).toBe(false);
+    expect(probe?.detail).toContain("unexpected unhandled database failure");
+  });
+
+  it("a mock with invalid capabilities structure fails the capabilities probe", async () => {
+    const invalidCapsAdapter: AnchorAdapter = {
+      ...createMockAdapter(),
+      capabilities() {
+        return {
+          protocol: "",
+          quotes: [] as unknown as "sep38_firm"[],
+          kyc: "invalid_kyc" as unknown as "sep12",
+          settlement: [],
+          refunds: "none",
+          callbacks: false,
+        };
+      },
+    };
+
+    const report = await runConformance(invalidCapsAdapter, { intent, corridor: corridor() });
+    expect(report.passed).toBe(false);
+    const probe = report.results.find((r) => r.name === "capabilities well-formed");
+    expect(probe?.passed).toBe(false);
   });
 });

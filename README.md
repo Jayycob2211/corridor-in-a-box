@@ -12,12 +12,14 @@ corridor is a new `*.corridor.yaml` file — not a fork.
 **Live demo:** [corridor-in-a-box.vercel.app](https://corridor-in-a-box.vercel.app)
 — the corridor dashboard and a payment walkthrough. **The walkthrough is a
 simulation**: it drives a re-implementation of the state machine and never
-touches the Stellar network. `ng-cowrie` is the one exception: its endpoints
-were probed against Cowrie's production API on 2026-08-11 — SEP-10 signed a
-challenge, SEP-12 answered, and SEP-31 `/info` returned a non-empty receive
-list — so it renders `VERIFIED`. That means endpoints were checked, not that
-money moved: Cowrie publishes no SEP-38 quote server, no payment has been
-attempted, and no business relationship is in place. Every other shipped
+touches the Stellar network. `ng-cowrie` is the one exception **in the demo's
+bundled lanes**: its endpoints were probed against Cowrie's production API on
+2026-08-11 — SEP-10 signed a challenge, SEP-12 answered, and SEP-31 `/info`
+returned a non-empty receive list — so it renders `VERIFIED`. That means
+endpoints were checked, not that money moved: Cowrie publishes no SEP-38 quote
+server, no payment has been attempted, and no business relationship is in place.
+`corridors/zeam.corridor.yaml` is a second probed lane in the repo — `VERIFIED`
+since 2026-10-17, see the sequencing table below — and every other shipped
 manifest renders `UNVERIFIED` or `NOT RUNNABLE` (see [Liveness](#liveness-has-four-states-and-green-has-to-be-earned)).
 
 This repo contains the **open, runnable corridor engine** and the `RouteResolver`
@@ -41,6 +43,8 @@ pnpm typecheck          # whole monorepo, one tsc pass
 pnpm test               # vitest: engine, manifest, money, sep31, stellar, …
 pnpm example            # run a payment end-to-end (mocked anchor + settle)
 pnpm cli plan corridors/reference.corridor.yaml   # offline pre-flight / liveness check
+CORRIDOR_SIGNER_SECRET=S… pnpm cli canary corridors/reference.corridor.yaml \
+  --amount 1.00 --dry-run                          # real anchor up to the pre-settle gate, no payment
 CORRIDOR_SIGNER_SECRET=S… pnpm cli canary corridors/reference.corridor.yaml \
   --amount 1.00 --write                            # MOVES MONEY: canary + proof
 ```
@@ -68,8 +72,9 @@ packages/
   sep31/         ONE generic adapter for any standards-compliant SEP-31
                  anchor (SEP-10 auth + SEP-12 KYC; crypto behind an injected signer)
   sep6/          ONE generic adapter for any standards-compliant SEP-6
-                 anchor (GET /info discovery + capabilities; the transfer
-                 verbs land in their own issues)
+                 anchor: GET /info discovery + capabilities, opens
+                 GET /withdraw-exchange and reads the deposit instructions back
+                 from GET /transaction, so settle and reconcile are unchanged
   stellar/       the only package on the money path that touches the chain;
                  @stellar/stellar-sdk-backed settlement submitter + SEP-10 signer
   router/        RouteResolver seam — open interface + two resolvers (Static + Registry)
@@ -83,8 +88,8 @@ corridors/       the manifests — ALL corridor-specifics live here,
                  nowhere else
 contracts/       Soroban registry + attester contracts
 scripts/         reference-anchor.sh + assert-testnet-corridor.ts
-docs/            key management, "why not Anchor Platform", SEP coverage,
-                 operations, …
+docs/            key management, bespoke adapters, "why not Anchor Platform",
+                 SEP coverage, operations, …
 examples/        runnable end-to-end demo
 ```
 
@@ -95,8 +100,9 @@ Three boundaries do the work:
    YAML file, not a code change.
 2. **engine ↔ adapters** — the engine knows only the `AnchorAdapter` interface.
    Standards-compliant anchors share one adapter; bespoke exchange/OTC desks
-   implement the same interface. Proprietary implementations could be maintained
-   separately; none is included in this repo.
+   implement the same interface (see [docs/adapters.md](./docs/adapters.md)).
+   Proprietary implementations could be maintained separately; none is included
+   in this repo.
 3. **router seam** — the open repo ships the `RouteResolver` interface plus two
    resolvers: `StaticRouteResolver` (trust the manifest) and
    `RegistryRouteResolver` (require a fresh on-chain attestation). A
@@ -113,6 +119,7 @@ _live receiving anchor_ on the destination side, so corridors ship in this order
 | ------ | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **#0** | `reference.corridor.yaml` (Anchor Platform reference, testnet)                     | Run it yourself, no agreements. Proves the engine moves through all five verbs against a conformant SEP-31 server. **Start here.**                                                                       |
 | **#1** | `ng-cowrie.corridor.yaml` (USD → NGN via Cowrie Exchange) — **VERIFIED endpoints** | First real lane. Endpoints confirmed 2026-08-11 via `@corridor/probe`. `quote_source: external` (no SEP-38). No payment attempted, no business relationship in place — see the manifest's `status_note`. |
+| **#2** | `zeam.corridor.yaml` (USD → ZAR via Zeam) — **VERIFIED endpoints**                 | Second real lane, and the first with a firm-quote path: probed 2026-10-17, SEP-10/12/31/38 all answer and SEP-31 receives USDC. No payment attempted, no business relationship in place.                 |
 | later  | `ng-cn.corridor.yaml` (Nigeria → China)                                            | The headline case study. Becomes runnable on the same engine the day a compliant RMB SEP-31 off-ramp exists — fill in `dest.endpoints`, nothing else.                                                    |
 
 > **Template**: `mx-example.corridor.yaml` (Mexico) shows the _shape_ of a real
@@ -148,10 +155,11 @@ type a URL into a YAML file. So `corridor plan` and the dashboard report:
 | `PROVEN`       | A canary payment also completed through the lane, and that proof is still fresh.         |
 
 `VERIFIED` requires `dest.endpoints.endpoints_verified_at` — a date a human sets
-only after actually looking. `ng-cowrie` is `VERIFIED`: its endpoints were
-probed on 2026-08-11, and SEP-10, SEP-12, and SEP-31 answered. This does not
-mean money moved — Cowrie publishes no SEP-38 quote server, no payment has
-been attempted, and no business relationship is in place. Every other shipped
+only after actually looking. Two shipped manifests have it: `ng-cowrie`, probed
+on 2026-08-11 (SEP-10, SEP-12 and SEP-31 answered), and `zeam`, probed on
+2026-10-17 (SEP-10, SEP-12, SEP-31 and a firm SEP-38 quote). For both, this does
+not mean money moved — no payment has been attempted and no business relationship
+is in place, and Cowrie publishes no SEP-38 quote server. Every other shipped
 manifest is currently `UNVERIFIED` or `NOT RUNNABLE`. Green has to be earned;
 here, `VERIFIED` means endpoints were checked, not that a payment was made.
 
@@ -224,11 +232,20 @@ Every record carries `attested_ledger`, so staleness is visible on chain. An
 attestation is never wrong, only old, and a consumer must be able to see the
 difference without trusting the writer to have pruned it.
 
+Soroban storage expires, so a record nobody touches would eventually be archived
+and `get_anchor` would fail. Every write extends the entry it touched and the
+contract instance by 90 days (when under 30 are left), and `bump(domain)` lets
+anyone extend a record without re-attesting it; it leaves `attested_ledger`
+alone, so a bumped record is kept alive but not made to look fresh. An entry that
+has already been archived has to be restored first (a `RestoreFootprint`
+operation, `stellar contract restore`); see the header of
+`contracts/registry/src/lib.rs`.
+
 ```bash
 pnpm probe:anchor testanchor.stellar.org   # probe a live anchor, print the facts
 pnpm registry:read                         # read the registry via @corridor/registry
 pnpm registry:read --sep 24 --passed sep10_auth   # filter; --max-age and --json too
-cd contracts && cargo test                 # 21 contract tests
+cd contracts && cargo test                 # 39 contract tests
 ```
 
 ## Proof against a real SEP-31 anchor

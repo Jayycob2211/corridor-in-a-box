@@ -25,6 +25,8 @@ export const PROBE_NAMES = [
   "sep38_quote",
   "sep12_status",
   "sep31_info",
+  "sep6_info",
+  "sep6_auth",
 ] as const;
 
 export type ProbeName = (typeof PROBE_NAMES)[number];
@@ -103,13 +105,31 @@ const str = (s: string) => nativeToScVal(s, { type: "string" });
  * Returns an empty array rather than throwing when the registry is unreachable:
  * a dashboard that cannot reach the chain should say it has no data, not crash.
  * The caller distinguishes "no attestations" from "could not read" via `ok`.
+ *
+ * `readAt` and `latestLedger` say when this snapshot was taken, so a page that
+ * serves it from cache can say how old it is instead of presenting it as live.
  */
 export async function fetchAttestations(): Promise<{
   ok: boolean;
   error?: string;
   anchors: AnchorAttestation[];
+  /** ISO time the read started. Set even when the read failed. */
+  readAt: string;
+  /** The RPC's latest ledger at read time; absent when it could not be read. */
+  latestLedger?: number;
 }> {
+  const readAt = new Date().toISOString();
   try {
+    const cfg = config(REGISTRY_NETWORK);
+    // Read before the anchors so the ledger is a lower bound on what they reflect.
+    // Best-effort: the ledger only labels the snapshot, so failing to get it
+    // must not hide attestations that read fine.
+    const latestLedger = cfg
+      ? await new rpc.Server(cfg.rpcUrl)
+          .getLatestLedger()
+          .then((l) => l.sequence)
+          .catch(() => undefined)
+      : undefined;
     const domains = await read<string[]>("domains");
     const anchors = await Promise.all(
       domains.map(async (domain) => {
@@ -132,12 +152,13 @@ export async function fetchAttestations(): Promise<{
       }),
     );
     anchors.sort((a, b) => a.domain.localeCompare(b.domain));
-    return { ok: true, anchors };
+    return { ok: true, anchors, readAt, latestLedger };
   } catch (e) {
     return {
       ok: false,
       error: e instanceof Error ? e.message : String(e),
       anchors: [],
+      readAt,
     };
   }
 }

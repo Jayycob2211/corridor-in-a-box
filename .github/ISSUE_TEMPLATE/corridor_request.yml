@@ -1,6 +1,8 @@
 name: New corridor
 description: Propose a new corridor manifest (a *.corridor.yaml lane).
-labels: ["corridor"]
+# "corridor" is not a label in this repo, and a form naming a label that does not
+# exist fails at creation time. Use an existing one.
+labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
@@ -8,39 +10,64 @@ body:
         A corridor is **configuration, not code**. A new lane is a new
         `*.corridor.yaml`, never a change to `packages/engine`. If your lane needs
         engine behaviour that doesn't exist yet, open a regular issue instead.
+
+        Every claim below needs evidence. A request that picks endpoints from
+        memory, or pastes URLs it typed itself, is the unverified-endpoint problem
+        `liveness.ts` exists to prevent — those lanes render amber, never green.
   - type: input
     id: lane
     attributes:
       label: Lane
       description: Source → destination, with the receiving anchor.
-      placeholder: "MX → AR via Bitso / Anclap"
+      placeholder: "US → MX via <receiving anchor>"
     validations:
       required: true
-  - type: dropdown
-    id: liveness
+  - type: input
+    id: home_domain
     attributes:
-      label: What does `pnpm cli plan` report?
-      description: Run `pnpm cli plan corridors/your-lane.corridor.yaml` and pick the state.
+      label: Destination anchor home domain
+      description: |
+        The anchor's home domain as listed on https://anchors.stellar.org — the
+        value that resolves to https://<home_domain>/.well-known/stellar.toml.
+        Not an API host, not a docs URL.
+      placeholder: "anchor.example"
+    validations:
+      required: true
+  - type: textarea
+    id: probe_output
+    attributes:
+      label: Probe output
+      description: |
+        Paste the full, unedited output of `pnpm probe:anchor <home_domain>`.
+        This is the evidence for every endpoint claim below; without it the
+        request cannot be reviewed.
+      render: text
+      placeholder: |
+        $ pnpm probe:anchor anchor.example
+        ... paste the complete output here ...
+    validations:
+      required: true
+  - type: checkboxes
+    id: seps
+    attributes:
+      label: Which transfer SEPs did the probe show?
+      description: |
+        Select everything the probe actually showed. SEP-6/SEP-24-only lanes are
+        tracked as blocked on adapter support: they may be real anchors, but this
+        engine settles over SEP-31.
       options:
-        - "NOT RUNNABLE — a required endpoint is missing outright"
-        - "UNVERIFIED — endpoints present but not confirmed against stellar.toml"
-        - "VERIFIED — endpoints checked against anchor's published stellar.toml on a recorded date"
+        - label: SEP-31 receive passed
+        - label: SEP-24 advertised
+        - label: SEP-6 advertised
+        - label: none of the above
     validations:
       required: true
   - type: input
     id: verified_at
     attributes:
       label: Date you fetched stellar.toml
-      description: If VERIFIED, the date you confirmed endpoints against https://<home_domain>/.well-known/stellar.toml (YYYY-MM-DD).
+      description: The date you confirmed the endpoints below against https://<home_domain>/.well-known/stellar.toml (YYYY-MM-DD).
       placeholder: "2026-01-15"
-    validations:
-      required: false
-  - type: textarea
-    id: probe_output
-    attributes:
-      label: Probe output (if run)
-      description: Paste the output of `@corridor/probe` if you ran it against the anchor's stellar.toml.
-      render: text
     validations:
       required: false
   - type: textarea
@@ -48,7 +75,8 @@ body:
     attributes:
       label: Known stellar.toml endpoint keys
       description: |
-        List the keys from the anchor's published stellar.toml. The probe reads:
+        Copy the values verbatim from the anchor's published stellar.toml. The
+        probe reads:
         - `DIRECT_PAYMENT_SERVER` (SEP-31)
         - `ANCHOR_QUOTE_SERVER` (SEP-38)
         - `WEB_AUTH_ENDPOINT` (SEP-10)
@@ -56,8 +84,13 @@ body:
         - `TRANSFER_SERVER` (SEP-6)
         - `TRANSFER_SERVER_SEP0024` (SEP-24)
 
-        Note: Most real ramps are SEP-24/SEP-6, not SEP-31. Say which SEPs the anchor actually publishes.
+        Note: most real ramps are SEP-24/SEP-6, not SEP-31. Say which SEPs the
+        anchor actually publishes.
       render: yaml
+      placeholder: |
+        DIRECT_PAYMENT_SERVER: https://...
+        WEB_AUTH_ENDPOINT: https://...
+        KYC_SERVER: https://...
     validations:
       required: false
   - type: textarea

@@ -15,7 +15,6 @@
 
 import type { Sep31Anchor, Corridor } from "@corridor/manifest";
 import {
-  compareAmounts,
   fail,
   isValidAmount,
   ok,
@@ -30,28 +29,24 @@ import {
   type KycResult,
   type OpenTransaction,
   type Quote,
-  type RefundInfo,
-  type RefundPayment,
   type RefundRef,
   Sep38QuoteProvider,
   type TransactionStatus,
+  parseRefunds,
 } from "@corridor/adapter-kit";
+import { Sep10Client, type Sep10Signer } from "@corridor/adapter-kit";
 import type { CheckResult, GateCheck, GateContext } from "@corridor/engine";
 
 type FetchLike = typeof fetch;
+
+export type { RefundInfo, RefundPayment } from "@corridor/adapter-kit";
+export type { Sep10Signer } from "@corridor/adapter-kit";
 
 /**
  * Signs a SEP-10 challenge. The concrete implementation (Keypair + Transaction
  * from @stellar/stellar-sdk) is supplied by the caller, keeping this package
  * free of a chain SDK. See @corridor/stellar for a ready-made signer.
  */
-export interface Sep10Signer {
-  /** The Stellar account (G…) being authenticated. */
-  readonly account: string;
-  /** Sign the base64 challenge XDR and return the signed XDR. */
-  signChallenge(challengeXdr: string, networkPassphrase: string): Promise<string>;
-}
-
 export interface Sep31AdapterOptions {
   /** Inject a fetch implementation (defaults to global fetch). Handy for tests. */
   fetchImpl?: FetchLike;
@@ -136,36 +131,16 @@ export function mapSep31Status(raw: string): {
   return { status, settled: false, terminalFailure: false, awaitingInput: false };
 }
 
-/** The `refunds` object as SEP-31 puts it on the wire — every field untrusted. */
-interface RawRefunds {
-  amount_refunded?: unknown;
-  amount_fee?: unknown;
-  payments?: unknown;
-}
+export { parseRefunds };
 
-/**
- * A decimal amount string, or undefined if the anchor sent anything else.
- *
- * Deliberately refuses numbers. An anchor that sends `100.1` as JSON has
- * already put the value through a float64, and accepting it here would launder
- * that into a `Money` the rest of the system trusts. Better to report nothing
- * than to report a number that has already lost precision.
- */
 function amountString(v: unknown): string | undefined {
   return typeof v === "string" && isValidAmount(v.trim()) ? v.trim() : undefined;
 }
 
-/** A non-empty string, or undefined if the anchor sent anything else. */
 function nonEmptyString(v: unknown): string | undefined {
   return typeof v === "string" && v ? v : undefined;
 }
 
-/**
- * SEP-31's `stellar_memo_type`, case-insensitively, or undefined when absent or
- * not one of the three memo encodings Stellar supports. Never defaulted to
- * "text" here: a hash memo encoded as text is corrupted, so an unknown type is
- * reported as unknown.
- */
 function parseMemoType(v: unknown): "text" | "hash" | "id" | undefined {
   const memoType = typeof v === "string" ? v.toLowerCase() : undefined;
   return memoType === "hash" || memoType === "id" || memoType === "text"
@@ -173,85 +148,7 @@ function parseMemoType(v: unknown): "text" | "hash" | "id" | undefined {
     : undefined;
 }
 
-/**
- * Parse SEP-31's `refunds` object off a transaction record.
- *
- * Everything is optional and untrusted: anchors omit `refunds` entirely on the
- * happy path, amounts arrive as strings, and a malformed field must never turn
- * a poll into an error — the status classification is what the engine acts on
- * and it is decided independently of this.
- *
- * Returns undefined rather than a zero-filled object when the refund cannot be
- * read: "refunded nothing" and "said nothing" are different facts, and the
- * engine must not be able to confuse them.
- *
- * @param settledAmount the amount that went out (`amount_in`), used to tell a
- * partial refund from a full one. Compared with `compareAmounts` — "100" and
- * "100.00" are the same amount of money and string equality says otherwise.
- */
-export function parseRefunds(
-  refunds: unknown,
-  asset: string,
-  settledAmount?: string,
-): RefundInfo | undefined {
-  if (!refunds || typeof refunds !== "object" || Array.isArray(refunds)) return undefined;
-  const raw = refunds as RawRefunds;
-
-  const amountRefunded = amountString(raw.amount_refunded);
-  if (amountRefunded === undefined) return undefined;
-
-  // A missing fee is a real answer — nothing was withheld. A malformed one is
-  // not, but it does not invalidate the refunded amount, so it reads as zero.
-  const amountFee = amountString(raw.amount_fee) ?? "0";
-
-  const payments: RefundPayment[] = [];
-  if (Array.isArray(raw.payments)) {
-    for (const entry of raw.payments) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      const p = entry as { id?: unknown; id_type?: unknown; amount?: unknown; fee?: unknown };
-      const amount = amountString(p.amount);
-      // An entry with no id or no readable amount says nothing; drop that entry
-      // rather than the whole refund, which the totals above still describe.
-      if (typeof p.id !== "string" || !p.id || amount === undefined) continue;
-      payments.push({
-        id: p.id,
-        ...(typeof p.id_type === "string" && p.id_type ? { idType: p.id_type } : {}),
-        amount: { asset, amount },
-        fee: { asset, amount: amountString(p.fee) ?? "0" },
-      });
-    }
-  }
-
-  const settled = settledAmount !== undefined ? amountString(settledAmount) : undefined;
-  let completeness: RefundInfo["completeness"] = "unknown";
-  if (settled !== undefined) {
-    const cmp = compareAmounts(amountRefunded, settled);
-    // An over-refund (cmp > 0) is anomalous but not partial: the whole payment
-    // came back and then some. Reporting it as "partial" would be a lie.
-    if (cmp.ok) completeness = cmp.value < 0 ? "partial" : "full";
-  }
-
-  return {
-    amountRefunded: { asset, amount: amountRefunded },
-    amountFee: { asset, amount: amountFee },
-    payments,
-    completeness,
-  };
-}
-
 export { sep38SellAsset } from "@corridor/adapter-kit";
-
-/** Decode a JWT's `exp` claim (epoch ms) without verifying it. */
-function jwtExpiryMs(token: string): number | undefined {
-  const payload = token.split(".")[1];
-  if (!payload) return undefined;
-  try {
-    const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    return typeof json.exp === "number" ? json.exp * 1000 : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 export class Sep31Adapter implements AnchorAdapter {
   readonly name: string;
@@ -259,8 +156,8 @@ export class Sep31Adapter implements AnchorAdapter {
   /** Bridge asset for this corridor — the denomination `amount_in` is reported in. */
   private readonly settlementAsset: string;
   private readonly fetchImpl: FetchLike;
-  private readonly sep10?: Sep10Signer;
-  private cachedToken?: { token: string; expMs: number };
+  private readonly sep10: Sep10Client;
+  private readonly sep10Signer?: Sep10Signer;
   private readonly sep38Provider: Sep38QuoteProvider;
 
   constructor(corridor: Corridor, opts: Sep31AdapterOptions = {}) {
@@ -273,7 +170,13 @@ export class Sep31Adapter implements AnchorAdapter {
     this.settlementAsset = corridor.settlement.bridge_asset;
     this.name = corridor.dest.name;
     this.fetchImpl = opts.fetchImpl ?? fetch;
-    this.sep10 = opts.sep10;
+    this.sep10Signer = opts.sep10;
+    this.sep10 = new Sep10Client(
+      this.anchor.endpoints.web_auth,
+      this.anchor.endpoints.home_domain,
+      opts.sep10,
+      this.fetchImpl,
+    );
     this.sep38Provider = new Sep38QuoteProvider({
       context: "sep31",
       fetchImpl: this.fetchImpl,
@@ -293,54 +196,14 @@ export class Sep31Adapter implements AnchorAdapter {
   // handshake is a hard, retryable error. `ok(undefined)` means one thing only —
   // no auth was configured for this anchor, so anonymous access is intended.
   private async authToken(): Promise<Outcome<string | undefined>> {
-    const webAuth = this.anchor.endpoints.web_auth;
-    if (!webAuth || !this.sep10) return ok(undefined);
-
-    const now = Date.now();
-    if (this.cachedToken && this.cachedToken.expMs - 30_000 > now) {
-      return ok(this.cachedToken.token);
-    }
-
-    const authFailed = (why: string) =>
-      fail("ANCHOR_UNAVAILABLE", `${this.name}: SEP-10 auth failed (${why})`, {
-        retryable: true,
-      });
-
-    try {
-      const url = new URL(webAuth);
-      url.searchParams.set("account", this.sep10.account);
-      url.searchParams.set("home_domain", this.anchor.endpoints.home_domain);
-      const challengeRes = await this.fetchImpl(url.toString());
-      if (!challengeRes.ok) return authFailed(`challenge HTTP ${challengeRes.status}`);
-      const challenge = (await challengeRes.json()) as {
-        transaction?: string;
-        network_passphrase?: string;
-      };
-      if (!challenge.transaction || !challenge.network_passphrase) {
-        return authFailed("challenge response missing transaction/network_passphrase");
-      }
-
-      const signed = await this.sep10.signChallenge(
-        challenge.transaction,
-        challenge.network_passphrase,
-      );
-      const tokenRes = await this.fetchImpl(webAuth, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ transaction: signed }),
-      });
-      if (!tokenRes.ok) return authFailed(`token HTTP ${tokenRes.status}`);
-      const { token } = (await tokenRes.json()) as { token?: string };
-      if (!token) return authFailed("token response missing `token`");
-
-      this.cachedToken = { token, expMs: jwtExpiryMs(token) ?? now + 15 * 60_000 };
-      return ok(token);
-    } catch (cause) {
-      return fail("ANCHOR_UNAVAILABLE", `${this.name}: SEP-10 auth request failed`, {
-        retryable: true,
-        cause,
+    const auth = await this.sep10.token();
+    if (!auth.ok) {
+      return fail(auth.error.code, `${this.name}: ${auth.error.message}`, {
+        retryable: auth.error.retryable,
+        cause: auth.error.cause,
       });
     }
+    return auth;
   }
 
   /** `Authorization` header for an authenticated call, or {} when the corridor
@@ -413,8 +276,8 @@ export class Sep31Adapter implements AnchorAdapter {
           ...this.authHeader(auth.value),
         },
         body: JSON.stringify({
-          ...((opts.account ?? this.sep10?.account)
-            ? { account: opts.account ?? this.sep10?.account }
+          ...((opts.account ?? this.sep10Signer?.account)
+            ? { account: opts.account ?? this.sep10Signer?.account }
             : {}),
           ...(opts.type ? { type: opts.type } : {}),
           ...fields,

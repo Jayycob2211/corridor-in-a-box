@@ -1,0 +1,35 @@
+# Gitleaks configuration for corridor-in-a-box.
+# Extends the default ruleset and adds a rule for Stellar secret seeds, which the
+# defaults do not know about. `CORRIDOR_SIGNER_SECRET` and `ATTESTER_SECRET` are
+# S-seeds, so one pushed in a PR must fail CI.
+
+title = "corridor-in-a-box gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "stellar-secret-seed"
+description = "Stellar secret seed (S...) detected"
+regex = '''\bS[A-Z2-7]{55}\b'''
+entropy = 3.5
+keywords = ["s"]
+tags = ["key", "stellar", "secret"]
+
+# Known public values only. Each entry is a specific, documented non-secret, never a
+# pattern: a loose pattern here would let a real seed through.
+[[allowlists]]
+description = "Public testnet fixtures"
+targetRules = ["stellar-secret-seed"]
+regexes = [
+  # The Stellar reference server's testnet distribution account, public config
+  # (examples/fund-testnet-sender.ts).
+  '''SAJW2O2NH5QMMVWYAN352OEXS2RUY675A2HPK5HEG2FRR2NXPYA4OLYN''',
+]
+
+# The generic high-entropy rule trips on public keys (G...) and fixtures in tests. Only
+# that rule is relaxed there; `stellar-secret-seed` still applies to tests/.
+[[allowlists]]
+description = "Test fixtures: public keys and sample values"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/''']

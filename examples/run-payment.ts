@@ -15,6 +15,9 @@
 //
 // The quote is non-firm. With `who_holds_risk: receiving_anchor` the engine
 // refuses an external quote unless the adapter's capabilities() lists "native".
+//
+// `pnpm example -- --dry-run` stops after the pre-settle gate: quote, comply,
+// open and every gate check run, the settle payment is never submitted.
 
 import { fileURLToPath } from "node:url";
 import { loadCorridor } from "@corridor/manifest";
@@ -61,9 +64,22 @@ async function main(): Promise<void> {
     sourceAmount: { asset: "USDC", amount: "100.00" },
   };
 
-  console.log(`running corridor "${corridor.id}" with intent ${intent.idempotencyKey}\n`);
+  const dryRun = process.argv.includes("--dry-run");
+  console.log(
+    `running corridor "${corridor.id}" with intent ${intent.idempotencyKey}${dryRun ? " (dry run)" : ""}\n`,
+  );
 
-  const result = await execute(intent, corridor, deps);
+  const result = await execute(intent, corridor, deps, { dryRun });
+
+  if (dryRun) {
+    const checks = audit.entries.find((e) => e.to === "verifying")?.checks ?? [];
+    const passed = !result.ok && result.error.code === "DRY_RUN_COMPLETE";
+    console.log(passed ? "✓ dry run passed the pre-settle gate" : "✗ dry run stopped early");
+    if (!result.ok) console.log(`  outcome:     ${result.error.code}`);
+    for (const c of checks) console.log(`  ${c.passed ? "✓" : "✗"} ${c.name}: ${c.detail}`);
+    console.log(`  audit:       ${audit.entries.length} transitions recorded`);
+    return;
+  }
 
   if (result.ok) {
     console.log("✓ payment completed");

@@ -16,7 +16,21 @@
     "isolatedModules": true,
     "incremental": true,
     "plugins": [{ "name": "next" }],
-    "paths": { "@/*": ["./*"] }
+    "paths": {
+      "@/*": ["./*"],
+      "@corridor/engine": ["../packages/engine/src/index.ts"],
+      "@corridor/adapter-kit": ["../packages/adapter-kit/src/index.ts"],
+      "@corridor/manifest": ["../packages/manifest/src/index.ts"],
+      "@corridor/router": ["../packages/router/src/index.ts"],
+      "@corridor/types": ["../packages/types/src/index.ts"],
+      "@corridor/probe": ["../packages/probe/src/index.ts"],
+      // Sources under ../packages import these by bare name, and resolution starts
+      // from THEIR directory (no node_modules up there when web/ is installed on its
+      // own), so point them at web/'s copies.
+      "zod": ["./node_modules/zod"],
+      "yaml": ["./node_modules/yaml"],
+      "@stellar/stellar-sdk": ["./node_modules/@stellar/stellar-sdk"]
+    }
   },
   // .next/dev/types is where Next 16 emits its generated route types.
   "include": [

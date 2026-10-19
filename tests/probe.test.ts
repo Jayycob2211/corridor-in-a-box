@@ -2,6 +2,8 @@
 // probes refusing to pass on weak evidence, so most of what is tested here is
 // what does NOT count as a pass.
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   Keypair,
@@ -21,6 +23,7 @@ import {
   sepBit,
   tomlHash as sharedTomlHash,
   tomlValue,
+  PROBE_NAMES,
   type ProbeName,
   type ProbeResult,
 } from "@corridor/probe";
@@ -66,6 +69,11 @@ interface StubOptions {
   quote?: { ok?: boolean; expiresAt?: string; assets?: boolean };
   sep12Status?: number;
   sep31Receive?: string[] | null;
+  sep6Info?: {
+    withdraw?: Record<string, { enabled?: boolean }> | null;
+    "withdraw-exchange"?: Record<string, { enabled?: boolean }> | null;
+  } | null;
+  sep6TransactionsStatus?: number;
 }
 
 function stub(o: StubOptions = {}) {
@@ -126,6 +134,19 @@ function stub(o: StubOptions = {}) {
           : receive,
       });
     }
+    if (u.includes("/sep6/info")) {
+      if (o.sep6Info === null) return json({}, 500);
+      if (o.sep6Info) return json(o.sep6Info);
+      return json({
+        withdraw: {
+          USDC: { enabled: true },
+        },
+      });
+    }
+    if (u.includes("/sep6/transactions")) {
+      const status = o.sep6TransactionsStatus ?? 200;
+      return json({ transactions: [] }, status);
+    }
     return json({}, 404);
   }) as unknown as typeof fetch;
 
@@ -150,6 +171,17 @@ describe("bitmaps", () => {
   it("decodes an empty mask to nothing", () => {
     expect(decodeSeps(0)).toEqual([]);
     expect(decodeProbes(0)).toEqual([]);
+  });
+
+  it("Bit order test asserts PROBE_NAMES matches the contract list", () => {
+    const contractPath = resolve(__dirname, "../contracts/registry/src/lib.rs");
+    const contractSrc = readFileSync(contractPath, "utf8");
+    const match = contractSrc.match(
+      /pub const PROBE_NAMES:\s*\[&str;\s*\d+\]\s*=\s*\[([\s\S]*?)\];/,
+    );
+    expect(match).toBeTruthy();
+    const contractNames = Array.from(match![1].matchAll(/"([^"]+)"/g)).map((m) => m[1]);
+    expect([...PROBE_NAMES]).toEqual(contractNames);
   });
 });
 
@@ -260,6 +292,8 @@ describe("probeAnchor", () => {
       "sep38_quote",
       "sep12_status",
       "sep31_info",
+      "sep6_info",
+      "sep6_auth",
     ]);
     expect(r.tomlHash).toMatch(/^[0-9a-f]{64}$/);
   });
@@ -273,6 +307,94 @@ describe("probeAnchor", () => {
     expect(decodeSeps(r.seps)).toContain(31); // advertised
     expect(ran(r, "sep31_info")).toBe(true); // we checked
     expect(passed(r, "sep31_info")).toBe(false); // and it does not work
+  });
+
+  it("passes sep6_info with non-empty withdraw or withdraw-exchange list, fails when empty", async () => {
+    const passWithdraw = await probeAnchor("a.example", {
+      fetchImpl: stub({
+        sep6Info: { withdraw: { USDC: { enabled: true } } },
+      }).fetchImpl,
+    });
+    expect(ran(passWithdraw, "sep6_info")).toBe(true);
+    expect(passed(passWithdraw, "sep6_info")).toBe(true);
+
+    const passExchange = await probeAnchor("a.example", {
+      fetchImpl: stub({
+        sep6Info: {
+          withdraw: {},
+          "withdraw-exchange": { USDC: { enabled: true } },
+        },
+      }).fetchImpl,
+    });
+    expect(passed(passExchange, "sep6_info")).toBe(true);
+
+    const failEmpty = await probeAnchor("a.example", {
+      fetchImpl: stub({
+        sep6Info: { withdraw: {}, "withdraw-exchange": {} },
+      }).fetchImpl,
+    });
+    expect(ran(failEmpty, "sep6_info")).toBe(true);
+    expect(passed(failEmpty, "sep6_info")).toBe(false);
+    const outcome = failEmpty.outcomes.find((o) => o.probe === "sep6_info");
+    expect(outcome?.detail).toContain("EMPTY");
+  });
+
+  it("fails sep6_info when all withdraw assets are disabled", async () => {
+    const r = await probeAnchor("a.example", {
+      fetchImpl: stub({
+        sep6Info: {
+          withdraw: { USDC: { enabled: false } },
+        },
+      }).fetchImpl,
+    });
+    expect(ran(r, "sep6_info")).toBe(true);
+    expect(passed(r, "sep6_info")).toBe(false);
+    const outcome = r.outcomes.find((o) => o.probe === "sep6_info");
+    expect(outcome?.detail).toContain("EMPTY");
+  });
+
+  it("passes sep6_auth on 2xx and 4xx, but fails on 5xx", async () => {
+    const ok200 = await probeAnchor("a.example", {
+      fetchImpl: stub({ sep6TransactionsStatus: 200 }).fetchImpl,
+    });
+    expect(ran(ok200, "sep6_auth")).toBe(true);
+    expect(passed(ok200, "sep6_auth")).toBe(true);
+
+    const ok400 = await probeAnchor("a.example", {
+      fetchImpl: stub({ sep6TransactionsStatus: 400 }).fetchImpl,
+    });
+    expect(ran(ok400, "sep6_auth")).toBe(true);
+    expect(passed(ok400, "sep6_auth")).toBe(true);
+
+    const fail500 = await probeAnchor("a.example", {
+      fetchImpl: stub({ sep6TransactionsStatus: 500 }).fetchImpl,
+    });
+    expect(ran(fail500, "sep6_auth")).toBe(true);
+    expect(passed(fail500, "sep6_auth")).toBe(false);
+  });
+
+  it("runs SEP-38 quote probe with context 'sep6' when only SEP-6 is advertised", async () => {
+    const sep6OnlyToml = `
+VERSION = "2.0.0"
+SIGNING_KEY = "GCHLHDBOKG2JWMJQBTLSL5XG6NO7ESXI2TAQKZXCXWXB5WI2X6W233PR"
+WEB_AUTH_ENDPOINT = "https://a.example/auth"
+TRANSFER_SERVER = "https://a.example/sep6"
+ANCHOR_QUOTE_SERVER = "https://a.example/sep38"
+`;
+    let quoteContext: string | undefined;
+    const { fetchImpl } = stub({ toml: sep6OnlyToml });
+    const spyFetch = (async (url: string | URL, init?: RequestInit) => {
+      if (String(url).includes("/sep38/quote") && init?.body) {
+        const body = JSON.parse(String(init.body));
+        quoteContext = body.context;
+      }
+      return fetchImpl(url, init);
+    }) as typeof fetch;
+
+    const r = await probeAnchor("a.example", { fetchImpl: spyFetch });
+    expect(decodeSeps(r.seps)).toEqual([1, 6, 10, 38]);
+    expect(quoteContext).toBe("sep6");
+    expect(passed(r, "sep38_quote")).toBe(true);
   });
 
   it("records nothing as run beyond the toml when the toml cannot be fetched", async () => {

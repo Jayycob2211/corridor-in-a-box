@@ -5,7 +5,7 @@
 // specific fact arrives via the validated manifest, every anchor-specific fact via
 // the injected RouteResolver/adapters. Add a corridor = add a manifest.
 
-import { liveness, type Corridor, type LivenessState } from "@corridor/manifest";
+import { liveness, hashCorridor, type Corridor, type LivenessState } from "@corridor/manifest";
 import {
   compareAmounts,
   fail,
@@ -177,6 +177,26 @@ export interface ExecuteOptions {
    * on-chain attestation.
    */
   trustManifestWithoutAttestation?: boolean;
+  /**
+   * Run quote → comply → open → pre-settle gate against the real anchor, then
+   * stop before `settling`: `SettlementSubmitter.submit()` (and `findExisting`)
+   * are never called. Every gate result is recorded on the audit trail.
+   *
+   * When the gate passes, the run is persisted as `failed` with
+   * `DRY_RUN_COMPLETE` and that error is returned, its `cause` carrying the
+   * gate report (`{ dryRun: true, checks }`). A gate refusal ends exactly as it
+   * would on a real run. Either way the idempotency key is spent.
+   *
+   * The receiving anchor is left holding an opened SEP-31 transaction that is
+   * never funded; it expires on the anchor's side.
+   */
+  dryRun?: boolean;
+}
+
+/** The `cause` of a `DRY_RUN_COMPLETE` error: what the gate said before the run stopped. */
+export interface DryRunReport {
+  readonly dryRun: true;
+  readonly checks: readonly CheckResult[];
 }
 
 /**
@@ -277,6 +297,8 @@ export async function execute(
 
   const run: StoredRun = {
     idempotencyKey: intent.idempotencyKey,
+    corridorId: corridor.id,
+    manifestHash: hashCorridor(corridor),
     state: "created",
     trail: ["created"],
     createdAt: now(),

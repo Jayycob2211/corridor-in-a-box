@@ -2,6 +2,7 @@
 //
 //   ATTESTER_SECRET=S... pnpm attest testanchor.stellar.org [more.example ...]
 //   ATTESTER_SECRET=S... pnpm attest            # every domain in anchors.json
+//   ATTESTER_SECRET=S... pnpm attest --from sweep.json
 //
 // This is the job the scheduled workflow runs. It probes for real and submits
 // exactly what it found — the point of the registry is that nobody, including
@@ -12,7 +13,15 @@
 
 import { readFileSync } from "node:fs";
 import { Keypair } from "@stellar/stellar-sdk";
-import { probeAnchor, decodeProbes, decodeSeps, loadFleet } from "@corridor/probe";
+import {
+  probeAnchor,
+  decodeProbes,
+  decodeSeps,
+  loadFleet,
+  loadProbeResultsFromFile,
+  parseAttestArgs,
+  type ProbeResult,
+} from "@corridor/probe";
 import { AnchorAttester, AttesterContractError } from "@corridor/attester";
 
 interface Deployments {
@@ -42,8 +51,25 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const domains =
-    process.argv.slice(2).length > 0 ? process.argv.slice(2) : loadFleet().domains;
+  const { from, domains } = parseAttestArgs(process.argv.slice(2));
+
+  let results: ProbeResult[];
+  if (from) {
+    console.log(`loading probe results from ${from}\n`);
+    const fileResults = loadProbeResultsFromFile(from);
+    results =
+      domains.length > 0 ? fileResults.filter((r) => domains.includes(r.domain)) : fileResults;
+    if (results.length === 0) {
+      console.error(`✗ no matching probe results found in ${from}`);
+      process.exit(1);
+    }
+  } else {
+    const targetDomains = domains.length > 0 ? domains : loadFleet().domains;
+    results = [];
+    for (const domain of targetDomains) {
+      results.push(await probeAnchor(domain));
+    }
+  }
 
   const attester = new AnchorAttester({
     rpcUrl: cfg.rpcUrl,
@@ -56,11 +82,10 @@ async function main(): Promise<void> {
   console.log(`contract ${cfg.attester}\n`);
 
   let failures = 0;
-  for (const domain of domains) {
-    const result = await probeAnchor(domain);
+  for (const result of results) {
     const passed = decodeProbes(result.probesPassed);
     const failed = decodeProbes(result.probesRun).filter((p) => !passed.includes(p));
-    console.log(`${domain}`);
+    console.log(`${result.domain}`);
     console.log(
       `  advertises  ${
         decodeSeps(result.seps)
@@ -88,7 +113,7 @@ async function main(): Promise<void> {
   }
 
   if (failures > 0) {
-    console.error(`${failures} of ${domains.length} attestations failed`);
+    console.error(`${failures} of ${results.length} attestations failed`);
     process.exit(1);
   }
 }

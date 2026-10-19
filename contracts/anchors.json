@@ -6,14 +6,32 @@
     "a registry is only useful if it is willing to record that an anchor does not",
     "work. Open a PR to add one.",
     "",
-    "testanchor.stellar.org is the SDF test anchor. It currently advertises SEP-31",
-    "and returns an empty receive list, so it attests as NOT serving SEP-31 — a",
-    "useful demonstration that the registry reports capability rather than claims.",
+    "Adding an anchor (manual procedure): the Stellar Anchor Directory (anchors.stellar.org)",
+    "is a human-facing web app. As of 2026-10-18 it publishes no JSON feed or API (/api/anchors",
+    "redirects to an HTML page), so this fleet is curated by hand, not seeded automatically.",
+    "To add an anchor: (1) find it in the directory or on the anchor's own site and confirm its",
+    "home domain publishes a stellar.toml; (2) run `pnpm probe:anchor <domain>` to confirm it",
+    "responds; (3) add a structured entry to `anchors` and the domain to `domains`, then open a",
+    "PR. Never invent domains: every added entry must come from the directory or the anchor's",
+    "own site. See docs/operations.md section 0.",
+    "",
+    "testanchor.stellar.org is the SDF test anchor. It advertises SEP-31 but returns",
+    "an empty receive list, so it attests as NOT serving SEP-31: a useful demonstration",
+    "that the registry reports capability rather than claims. It is also the SDF's",
+    "reference SEP-6/SEP-24 anchor on testnet; see corridors/testanchor-sep6.corridor.yaml",
+    "(endpoints read from its stellar.toml, 2026-10-17).",
     "",
     "cowrie.exchange is a real production anchor (Cowrie Exchange, Lagos, Nigeria;",
     "see corridors/ng-cowrie.corridor.yaml). Confirmed 2026-08-11 by running the",
     "probe against it directly: SEP-10 auth and SEP-31 (receives NGNT, USDC) both",
     "pass; no SEP-38 quote server is published.",
+    "",
+    "mint.zeam.money is Zeam (South Africa; see corridors/zeam.corridor.yaml).",
+    "Confirmed 2026-10-17 by running the probe against it directly: SEP-10 signed",
+    "a challenge and got a JWT, SEP-38 returned a firm quote, SEP-12 answered, and",
+    "SEP-31 /info receives USDC. It advertises no TRANSFER_SERVER, so SEP-6 is not",
+    "on offer even though the Anchor Directory entry lists it as a supported",
+    "standard — the toml, not the directory, decides which protocol we can drive.",
     "",
     "stellar.org and lobstr.co were probed by hand during development and already",
     "hold records in the registry. They are listed here because a record nobody",
@@ -34,6 +52,30 @@
     "SEP-10 and SEP-31 probes fail and no corridor manifest is written. Probed",
     "2026-10-16; MyKobo's status page listed the Anchor service as down at the time.",
     "",
+    "connect.clickpesa.com is ClickPesa (Tanzania, Kenya, Rwanda; sourced from",
+    "https://anchors.stellar.org/?s=ClickPesa). Probed 2026-10-17: toml_fetch fails",
+    "(DNS ENODATA / getaddrinfo ENOTFOUND; clickpesa.com returns HTTP 404). SEP-31",
+    "is not functional and no manifest is written; blocked on active stellar.toml/SEP-6.",
+    "",
+    "coins.ph is Coins.ph (Philippines), added from the Stellar Anchor Directory.",
+    "Probe result reported by the contributor on 2026-10-16: SEP-24/SEP-6 only, no SEP-31",
+    "receive side answers, so no corridor manifest is written. Blocked on SEP-6 support.",
+    "",
+    "vibrantapp.com is Vibrant (Argentina; SDF/Sunship non-custodial wallet). Not",
+    "listed in anchors.stellar.org. Probed 2026-10-17: toml_fetch returns HTTP 451",
+    "(vibrant.cash returns marketing HTML without anchor SEPs). Vibrant is a wallet,",
+    "not an anchor, and serves no SEP-31 receive endpoint; no manifest is written.",
+    "",
+    "testanchor.stellar.org is the SDF test anchor. It currently advertises SEP-31",
+    "and returns an empty receive list, so it attests as NOT serving SEP-31 — a",
+    "useful demonstration that the registry reports capability rather than claims.",
+    "stellar.moneygram.com, mercuryo.io, lightnet.io, owlting.com, arf.one and",
+    "stellar-sep-24.banxa.com were added for the ng-cn RMB off-ramp research (#230):",
+    "they are the Stellar Anchor Directory entries listing China, Hong Kong or",
+    "Singapore that publish a stellar.toml or claim a SEP. None advertises SEP-31",
+    "or a CNY/CNH/HKD asset; see corridors/ng-cn.corridor.yaml for the probe results",
+    "of 2026-10-18. Their countries are the directory's listing, not attested facts.",
+    "",
     "Each entry in `anchors` records curator-declared context (name, ISO 3166-1",
     "alpha-2 countries, kind, directory/manifest source, and date added). Countries",
     "and `kind` are curator-declared metadata, NOT attested facts; `domains` mirrors",
@@ -42,10 +84,20 @@
   "domains": [
     "testanchor.stellar.org",
     "cowrie.exchange",
+    "mint.zeam.money",
     "stellar.org",
     "lobstr.co",
     "blindpay.com",
-    "mykobo.co"
+    "mykobo.co",
+    "connect.clickpesa.com",
+    "coins.ph",
+    "vibrantapp.com",
+    "stellar.moneygram.com",
+    "mercuryo.io",
+    "lightnet.io",
+    "owlting.com",
+    "arf.one",
+    "stellar-sep-24.banxa.com"
   ],
   "anchors": [
     {
@@ -63,6 +115,14 @@
       "kind": "offramp",
       "source": "corridors/ng-cowrie.corridor.yaml",
       "added": "2026-08-11"
+    },
+    {
+      "domain": "mint.zeam.money",
+      "name": "Zeam",
+      "countries": ["CD", "MW", "ZA", "ZM", "ZW"],
+      "kind": "offramp",
+      "source": "corridors/zeam.corridor.yaml",
+      "added": "2026-10-17"
     },
     {
       "domain": "stellar.org",
@@ -95,6 +155,78 @@
       "kind": "other",
       "source": "https://anchors.stellar.org/?search=MyKobo",
       "added": "2026-10-16"
+    },
+    {
+      "domain": "connect.clickpesa.com",
+      "name": "ClickPesa",
+      "countries": ["TZ", "KE", "RW"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?s=ClickPesa",
+      "added": "2026-10-17"
+    },
+    {
+      "domain": "coins.ph",
+      "name": "Coins.ph",
+      "countries": ["PH"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org",
+      "added": "2026-10-16"
+    },
+    {
+      "domain": "vibrantapp.com",
+      "name": "Vibrant",
+      "countries": ["AR"],
+      "kind": "other",
+      "source": "https://vibrantapp.com",
+      "added": "2026-10-17"
+    },
+    {
+      "domain": "stellar.moneygram.com",
+      "name": "MoneyGram Ramps",
+      "countries": ["HK", "SG"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=MoneyGram",
+      "added": "2026-10-18"
+    },
+    {
+      "domain": "mercuryo.io",
+      "name": "Mercuryo",
+      "countries": ["CN", "SG"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=Mercuryo",
+      "added": "2026-10-18"
+    },
+    {
+      "domain": "lightnet.io",
+      "name": "Lightnet",
+      "countries": ["CN", "SG"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=Lightnet",
+      "added": "2026-10-18"
+    },
+    {
+      "domain": "owlting.com",
+      "name": "OwlPay",
+      "countries": ["CN", "HK", "SG"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=OwlPay",
+      "added": "2026-10-18"
+    },
+    {
+      "domain": "arf.one",
+      "name": "Arf",
+      "countries": ["CN", "SG"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=Arf",
+      "added": "2026-10-18"
+    },
+    {
+      "domain": "stellar-sep-24.banxa.com",
+      "name": "Banxa",
+      "countries": ["HK"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=Banxa",
+      "added": "2026-10-18"
     }
   ]
 }

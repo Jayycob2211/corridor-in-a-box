@@ -1,0 +1,55 @@
+# Corridor — testnet SEP-6 withdrawal via SDF reference test anchor (testanchor.stellar.org).
+#
+# Endpoints confirmed 2026-10-17 against published stellar.toml:
+#   TRANSFER_SERVER: https://testanchor.stellar.org/sep6
+#   TRANSFER_SERVER_SEP0024: https://testanchor.stellar.org/sep24
+#   WEB_AUTH_ENDPOINT: https://testanchor.stellar.org/auth
+#   KYC_SERVER: https://testanchor.stellar.org/sep12
+#   ANCHOR_QUOTE_SERVER: https://testanchor.stellar.org/sep38
+#
+# SEP-6 GET /info advertises deposit and withdrawal for SRT, USDC, native.
+# `@corridor/sep6` can drive a `dest.protocol: sep6` corridor, but `liveness()`
+# only recognises `transfer_server_sep31` today, so `corridor plan` reports this
+# lane as NOT runnable. That is a gap in the liveness check, not a finding about
+# the anchor; the endpoints below were read from its published stellar.toml.
+id: testanchor-sep6
+status_note: "SDF Test Anchor (testanchor.stellar.org) on testnet via SEP-6. Endpoints read from its stellar.toml 2026-10-17. No payment attempted. liveness() does not yet understand SEP-6 endpoints, so plan reports NOT runnable."
+
+source:
+  name: Testnet Sending Anchor
+  asset: USDC
+  endpoints:
+    home_domain: sending-anchor.example
+
+dest:
+  name: SDF Test Anchor (testnet)
+  asset: "iso4217:USD"
+  protocol: sep6
+  endpoints:
+    home_domain: testanchor.stellar.org
+    transfer_server: https://testanchor.stellar.org/sep6
+    web_auth: https://testanchor.stellar.org/auth
+    kyc_server: https://testanchor.stellar.org/sep12
+    quote_server: https://testanchor.stellar.org/sep38
+    endpoints_verified_at: "2026-10-17"
+
+fx:
+  path: ["USD", "USDC", "USD"]
+  quote_source: sep38
+  who_holds_risk: receiving_anchor
+  quote_ttl_seconds: 60
+
+compliance:
+  source_jurisdiction: US
+  dest_jurisdiction: US
+  travel_rule_profile: default
+
+settlement:
+  bridge_asset: USDC
+  network: testnet
+  asset_issuer: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+
+recovery:
+  max_retries: 3
+  timeout_seconds: 900
+  rollback: refund_sender

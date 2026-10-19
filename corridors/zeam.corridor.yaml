@@ -1,0 +1,87 @@
+# Corridor — USD → South Africa (ZAR) via Zeam, a real SEP-31 anchor.
+#
+# Every endpoint below is REAL and was copied verbatim from Zeam's published
+# stellar.toml at its home domain `mint.zeam.money` (the `toml_file` the Stellar
+# Anchor Directory lists for the "Zeam" entry:
+# https://anchors.stellar.org/ → search "Zeam" → TOML `https://mint.zeam.money/
+# .well-known/stellar.toml`; the app itself is at https://zeam.money).
+#
+# Confirmed 2026-10-17 by running `@corridor/probe` against it
+# (`pnpm probe:anchor mint.zeam.money`, toml sha256
+# 92a309791b0eefff07c1e2e509f93c51aac9947daa5ed1507bc8a5e12511dde7):
+#   - toml_fetch    ok
+#   - sep10_auth    challenge signed, JWT issued
+#   - sep38_quote   firm quote returned with a future expiry
+#   - sep12_status  endpoint speaks SEP-12 (404 for the probe's unknown id)
+#   - sep31_info    receive list is non-empty: USDC
+# That is why `endpoints_verified_at` is set and `corridor plan` reports VERIFIED.
+#
+# The payout currency is ZAR, NOT the KES this issue assumed. Zeam's toml anchors
+# two fiat assets — `ZARZ` (anchor_asset ZAR, South African Reserve Bank TPP
+# SO001233) and `GBPZ` — and its Anchor Directory entry lists the Democratic
+# Republic of the Congo, Malawi, South Africa, Zambia and Zimbabwe. Nothing in
+# either source mentions Kenya, so `dest.asset` is `iso4217:ZAR`. Zeam publishes
+# no SEP-31 `send` list, so the payout asset is read off the anchored fiat in the
+# toml rather than off /info.
+#
+# Zeam publishes ANCHOR_QUOTE_SERVER (`/sep38`) and its `/sep31/info` says
+# `quotes_supported: true` for USDC, so `fx.quote_source` stays `sep38` — unlike
+# the Cowrie lane, which publishes no quote server and must use `external`.
+#
+# What is NOT true: no payment has been attempted, and none should be without a
+# KYC'd business relationship with Zeam — this repo has no such relationship.
+id: zeam
+status_note: "REAL — Zeam (mint.zeam.money), probed 2026-10-17: SEP-10/12/31/38 all answer. No payment attempted, no business relationship in place."
+
+source:
+  name: USD Sending Anchor
+  asset: USDC
+  endpoints:
+    home_domain: sending-anchor.example
+
+dest:
+  name: Zeam (South Africa)
+  asset: "iso4217:ZAR"
+  protocol: sep31
+  endpoints:
+    home_domain: mint.zeam.money
+    # DIRECT_PAYMENT_SERVER
+    transfer_server_sep31: https://anchor.zeam.money/sep31
+    # WEB_AUTH_ENDPOINT
+    web_auth: https://anchor.zeam.money/auth
+    # KYC_SERVER
+    kyc_server: https://anchor.zeam.money/customer
+    # ANCHOR_QUOTE_SERVER
+    quote_server: https://anchor.zeam.money/sep38
+    endpoints_verified_at: "2026-10-17"
+
+fx:
+  path: ["USD", "USDC", "ZAR"]
+  quote_source: sep38
+  who_holds_risk: receiving_anchor
+  quote_ttl_seconds: 60
+
+compliance:
+  source_jurisdiction: US
+  dest_jurisdiction: ZA
+  travel_rule_profile: default
+  # Both types are named by Zeam's own /sep31/info under
+  # receive.USDC.sep12.{sender,receiver}.types, not assumed from the defaults.
+  sep12_receiver_type: sep31-receiver
+  sep12_sender_type: sep31-sender
+
+settlement:
+  bridge_asset: USDC
+  network: public
+  asset_issuer: GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN # USDC mainnet issuer
+
+# Taken from /sep31/info receive.USDC (min_amount 1, max_amount 10000, in the
+# bridge asset, which here is also the source asset).
+limits:
+  min_amount: "1"
+  max_amount: "10000"
+
+recovery:
+  max_retries: 3
+  timeout_seconds: 900
+  rollback: refund_sender

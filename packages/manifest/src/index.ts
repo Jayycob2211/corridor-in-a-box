@@ -10,6 +10,7 @@
 
 import { z } from "zod";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import {
   ok,
@@ -407,6 +408,39 @@ export { parseYaml };
 function formatZodError(e: z.ZodError): string {
   return e.issues.map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`).join("; ");
 }
+
+/**
+ * Deterministic JSON stringify: object keys are sorted lexicographically,
+ * ensuring two objects with the same keys and values produce identical strings
+ * regardless of key insertion order.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => (item === undefined ? "null" : canonicalJson(item))).join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const entries: string[] = [];
+  for (const key of keys) {
+    const val = obj[key];
+    if (val !== undefined && typeof val !== "symbol" && typeof val !== "function") {
+      entries.push(`${JSON.stringify(key)}:${canonicalJson(val)}`);
+    }
+  }
+  return `{${entries.join(",")}}`;
+}
+
+/**
+ * Compute a stable SHA-256 hash of a validated Corridor manifest (canonical JSON).
+ */
+export function hashCorridor(corridor: Corridor): string {
+  return createHash("sha256").update(canonicalJson(corridor)).digest("hex");
+}
+
+export const manifestHash = hashCorridor;
 
 // Liveness lives beside the schema because it is a statement ABOUT a manifest:
 // whether the lane it describes can actually settle, and whether anyone has

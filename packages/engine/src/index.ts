@@ -1,6 +1,12 @@
 // @corridor/engine — corridor-agnostic orchestration of the five verbs.
 
-export { execute, type EngineDeps, type RunResult } from "./run";
+export {
+  execute,
+  type DryRunReport,
+  type EngineDeps,
+  type ExecuteOptions,
+  type RunResult,
+} from "./run";
 export { canTransition, isTerminal, TERMINAL, type CorridorState } from "./state";
 export {
   InMemoryIdempotencyStore,

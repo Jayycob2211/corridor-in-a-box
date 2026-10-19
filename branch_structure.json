@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-257-execute-strands-a-run-in-created-when",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-257-execute-strands-a-run-in-created-when": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-257-execute-strands-a-run-in-created-when",
+    "origin"
+  ]
+}

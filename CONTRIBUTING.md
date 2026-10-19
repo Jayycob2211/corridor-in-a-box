@@ -32,6 +32,21 @@ pnpm example             # run a payment end-to-end (mocked anchor + settle)
 Node 22+ and pnpm 9+ are required (see `.nvmrc` and `packageManager` in
 `package.json`).
 
+## Git hooks
+
+`pnpm install` runs a `prepare` script that installs [lefthook](https://github.com/evilmartians/lefthook)
+git hooks. On commit, staged files are checked quickly (< 5 s typical):
+
+- `prettier --write` on staged files
+- `eslint` on staged `.ts` files
+- `gitleaks git --staged` (with `.gitleaks.toml`) if `gitleaks` is installed
+  (skipped with a warning otherwise)
+- `rustfmt` on staged `contracts/**/*.rs` files
+
+To opt out for a single command, prefix it with `LEFTHOOK=0`, e.g.
+`LEFTHOOK=0 git commit -m "wip"`. Hooks are a convenience; CI still runs the
+full gate.
+
 ## Before you open a PR
 
 Run the full gate locally — CI runs the same three commands:

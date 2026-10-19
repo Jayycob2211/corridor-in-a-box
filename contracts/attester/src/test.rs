@@ -3,7 +3,10 @@
 use super::*;
 use corridor_registry::{Registry, RegistryClient as RegistryDirect};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Ledger as _,
+    },
     Address, BytesN, Env, String,
 };
 
@@ -244,4 +247,160 @@ fn the_registry_refuses_writes_that_do_not_come_through_the_attester() {
             .attester,
         outsider
     );
+}
+
+// ─── Storage lifetime ────────────────────────────────────────────────────────
+//
+// Soroban entries expire and are archived after their TTL. The unit-test
+// environment does NOT archive: an entry past its `live_until` is still readable
+// there, so reading state back after advancing the ledger proves nothing. These
+// tests assert the lifetime itself (`get_ttl`, ledgers left until expiry),
+// advancing the ledger the way a quiet network would.
+
+/// The test environment's default minimum persistent TTL: what an entry nobody
+/// extended is given.
+const DEFAULT_TTL: u32 = 4_096;
+
+fn advance(f: &Fixture, ledgers: u32) {
+    f.env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+fn entry_ttl(f: &Fixture, key: &DataKey) -> u32 {
+    f.env.as_contract(&f.attester_client.address, || {
+        f.env.storage().persistent().get_ttl(key)
+    })
+}
+
+fn instance_ttl(f: &Fixture) -> u32 {
+    f.env.as_contract(&f.attester_client.address, || {
+        f.env.storage().instance().get_ttl()
+    })
+}
+
+fn attest(f: &Fixture, d: &String) {
+    f.attester_client.attest(
+        &f.alice,
+        d,
+        &SEP31,
+        &hash(&f.env, 0xcd),
+        &PROBE_SEP31_INFO,
+        &PROBE_SEP31_INFO,
+    );
+}
+
+#[test]
+fn enrolling_an_attester_extends_its_entry_and_the_instance() {
+    let f = setup();
+
+    assert_eq!(
+        entry_ttl(&f, &DataKey::Attester(f.alice.clone())),
+        TTL_EXTEND_TO
+    );
+    assert_eq!(instance_ttl(&f), TTL_EXTEND_TO);
+}
+
+#[test]
+fn an_enrolment_outlives_the_default_ttl_by_a_wide_margin() {
+    let f = setup();
+
+    advance(&f, DEFAULT_TTL + 1);
+
+    // Past the point a bare `set` would have expired, the enrolment and the
+    // instance still have the rest of their extension to run, and an enrolled
+    // attester can still sign in.
+    assert_eq!(
+        entry_ttl(&f, &DataKey::Attester(f.alice.clone())),
+        TTL_EXTEND_TO - DEFAULT_TTL - 1
+    );
+    assert_eq!(instance_ttl(&f), TTL_EXTEND_TO - DEFAULT_TTL - 1);
+    assert!(f.attester_client.is_attester(&f.alice));
+    attest(&f, &domain(&f.env));
+}
+
+#[test]
+fn attesting_extends_the_cooldown_marker_the_signers_enrolment_and_the_instance() {
+    let f = setup();
+    let d = domain(&f.env);
+    advance(&f, TTL_EXTEND_TO - 100);
+    assert_eq!(entry_ttl(&f, &DataKey::Attester(f.alice.clone())), 100);
+    assert_eq!(instance_ttl(&f), 100);
+
+    attest(&f, &d);
+
+    assert_eq!(entry_ttl(&f, &DataKey::LastAttest(d)), TTL_EXTEND_TO);
+    // An attester that keeps attesting never lapses.
+    assert_eq!(
+        entry_ttl(&f, &DataKey::Attester(f.alice.clone())),
+        TTL_EXTEND_TO
+    );
+    assert_eq!(instance_ttl(&f), TTL_EXTEND_TO);
+}
+
+#[test]
+fn attesting_also_keeps_the_registry_instance_alive() {
+    // The cross-call goes through the real registry, so its own extension is part
+    // of the path this contract relies on. (The record's lifetime is pinned in the
+    // registry's own tests, where its storage key is visible.)
+    let f = setup();
+    advance(&f, TTL_EXTEND_TO - 100);
+    f.env.as_contract(&f.registry_client.address, || {
+        assert_eq!(f.env.storage().instance().get_ttl(), 100);
+    });
+
+    attest(&f, &domain(&f.env));
+
+    f.env.as_contract(&f.registry_client.address, || {
+        assert_eq!(f.env.storage().instance().get_ttl(), TTL_EXTEND_TO);
+    });
+}
+
+#[test]
+fn removing_an_attester_extends_its_entry() {
+    let f = setup();
+    advance(&f, TTL_EXTEND_TO - 100);
+
+    f.attester_client.remove_attester(&f.alice);
+
+    assert_eq!(
+        entry_ttl(&f, &DataKey::Attester(f.alice.clone())),
+        TTL_EXTEND_TO
+    );
+    assert_eq!(instance_ttl(&f), TTL_EXTEND_TO);
+}
+
+#[test]
+fn retuning_the_cooldown_extends_the_instance() {
+    let f = setup();
+    advance(&f, TTL_EXTEND_TO - 100);
+    assert_eq!(instance_ttl(&f), 100);
+
+    f.attester_client.set_min_interval(&1_000);
+
+    assert_eq!(instance_ttl(&f), TTL_EXTEND_TO);
+}
+
+#[test]
+fn a_cooldown_longer_than_the_default_ttl_is_still_enforced() {
+    // A cooldown marker that expired early would silently reopen the window, so
+    // its lifetime has to cover any cooldown the admin can set, not just 720.
+    let f = setup();
+    let d = domain(&f.env);
+    f.attester_client.set_min_interval(&10_000);
+    attest(&f, &d);
+
+    advance(&f, 4_500);
+
+    assert_eq!(
+        entry_ttl(&f, &DataKey::LastAttest(d.clone())),
+        TTL_EXTEND_TO - 4_500
+    );
+    let again = f.attester_client.try_attest(
+        &f.alice,
+        &d,
+        &SEP31,
+        &hash(&f.env, 0xcd),
+        &PROBE_SEP31_INFO,
+        &PROBE_SEP31_INFO,
+    );
+    assert_eq!(again, Err(Ok(Error::TooSoon)));
 }

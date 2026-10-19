@@ -16,8 +16,12 @@ import type { Corridor } from "@corridor/manifest";
 import { execute, type EngineDeps } from "@corridor/engine";
 import {
   constantTimeEqual,
+  err,
   isSettleableAmount,
+  ok,
   type CorridorErrorCode,
+  type Outcome,
+  type PartyRef,
   type PaymentIntent,
 } from "@corridor/types";
 
@@ -38,6 +42,17 @@ export interface RateLimitOptions {
 export interface RateLimiter {
   /** Consume one unit for `key`. Return false to reject (429). */
   take(key: string): boolean | Promise<boolean>;
+}
+
+/**
+ * A single named readiness check. `check()` must resolve when the dependency is
+ * healthy and throw (or reject) when it is not. Throwing with an `Error` is
+ * preferred so the log entry carries a message; the body returned to callers
+ * never includes the error text.
+ */
+export interface ReadinessCheck {
+  name: string;
+  check: () => Promise<void>;
 }
 
 export interface ServiceOptions {
@@ -69,10 +84,37 @@ export interface ServiceOptions {
    */
   trustProxy?: boolean;
   now?: () => number;
+  /**
+   * Optional list of readiness checks. `GET /readyz` runs each with a 5-second
+   * timeout and returns 200 when all pass, 503 when any fails. The response body
+   * lists per-check pass/fail status but never exposes internal error messages.
+   * While the service is draining (after `gracefulShutdown()` is called) `/readyz`
+   * always returns 503 so load balancers stop routing new traffic immediately.
+   */
+  readinessChecks?: ReadinessCheck[];
+  /**
+   * Timeout in milliseconds for each individual readiness check. Default 5000 ms.
+   */
+  readinessTimeoutMs?: number;
 }
 
 /** Default cap on a buffered request body. A payment intent is well under 1 KiB. */
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
+
+/** Default per-check timeout for /readyz. */
+const DEFAULT_READINESS_TIMEOUT_MS = 5_000;
+
+/**
+ * Build a `ReadinessCheck` for a `PostgresIdempotencyStore` (or any object with
+ * a `ping(): Promise<void>` method). Wire this into `ServiceOptions.readinessChecks`
+ * so `/readyz` reports store reachability before the load balancer routes traffic:
+ *
+ *   const store = new PostgresIdempotencyStore(pool);
+ *   createService({ …, readinessChecks: [storeCheck(store)] });
+ */
+export function storeCheck(store: { ping(): Promise<void> }, name = "store"): ReadinessCheck {
+  return { name, check: () => store.ping() };
+}
 
 export interface RouteResponse {
   status: number;
@@ -94,6 +136,7 @@ export interface RouteRequest {
 
 const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   MANIFEST_INVALID: 422,
+  MANIFEST_CHANGED: 409,
   CAPABILITY_MISMATCH: 422,
   AMOUNT_INVALID: 422,
   QUOTE_UNAVAILABLE: 502,
@@ -122,6 +165,9 @@ const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   // the caller can resolve.
   CORRIDOR_HALTED: 503,
   ENGINE_MISCONFIGURED: 500,
+  // The HTTP API never starts a dry run, so this only keeps the table total.
+  // 409, not 2xx: no payment was made, and the key is spent.
+  DRY_RUN_COMPLETE: 409,
 };
 
 /** Token-bucket rate limiter, keyed per client. In-memory; swap for Redis at scale. */
@@ -175,18 +221,192 @@ export class TokenBucket implements RateLimiter {
   }
 }
 
-function isPaymentBody(b: unknown): b is PaymentIntent {
-  if (typeof b !== "object" || b === null) return false;
-  const o = b as Record<string, unknown>;
-  const amount = o.sourceAmount as Record<string, unknown> | undefined;
-  return (
-    typeof o.idempotencyKey === "string" &&
-    typeof o.corridorId === "string" &&
-    typeof (o.sender as Record<string, unknown>)?.id === "string" &&
-    typeof (o.recipient as Record<string, unknown>)?.id === "string" &&
-    typeof amount?.asset === "string" &&
-    typeof amount?.amount === "string"
-  );
+/** A rejected payment body, pointing at the offending input so the caller can
+ *  fix exactly that field instead of re-reading the whole schema. */
+export interface PaymentBodyError {
+  /** Path of the offending input, e.g. "idempotencyKey", "sender.sep12Id",
+   *  "destinationFields.routing". `<body>` for a body that is not an object. */
+  readonly field: string;
+  /** Why it was rejected. Deliberately generic: no anchor internals, no echo
+   *  of the offending value beyond its name. */
+  readonly reason: string;
+}
+
+/** The only top-level fields POST /payments accepts. Unknown keys are refused
+ *  rather than ignored: a silently-dropped field is a caller debugging a typo
+ *  against an engine that never saw their input. */
+const PAYMENT_FIELDS = new Set([
+  "idempotencyKey",
+  "corridorId",
+  "sender",
+  "recipient",
+  "sourceAmount",
+  "destinationFields",
+]);
+
+/** idempotencyKey becomes a Postgres primary key and a log field. Bounded and
+ *  charset-checked here the same way the web route bounds it (web/app/api/payments/route.ts):
+ *  1-128 chars of [A-Za-z0-9._:-]. Same rule as the web proxy so the two
+ *  refuse the SAME bodies — a body one layer accepts and the other rejects is
+ *  a support ticket waiting to happen. */
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
+
+const MAX_IDEMPOTENCY_KEY = 128;
+const MAX_CORRIDOR_ID = 128;
+const MAX_DESTINATION_FIELD_KEYS = 50;
+const MAX_DESTINATION_FIELD_VALUE = 256;
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+const reject = (field: string, reason: string) => err({ field, reason });
+
+/** Sanity-check one party object (sender/recipient): the id must be a real,
+ *  non-empty string and the optional fields must at least be strings. */
+function parseParty(
+  v: unknown,
+  field: "sender" | "recipient",
+): Outcome<PartyRef, PaymentBodyError> {
+  if (!isPlainObject(v)) {
+    return reject(field, "expected an object with a string id");
+  }
+  for (const key of Object.keys(v)) {
+    if (key !== "id" && key !== "jurisdiction" && key !== "sep12Id") {
+      return reject(`${field}.${key}`, "unknown field");
+    }
+  }
+  if (typeof v.id !== "string") {
+    return reject(`${field}.id`, "expected a string");
+  }
+  if (v.id.length === 0) {
+    return reject(`${field}.id`, "must not be empty");
+  }
+  if ("jurisdiction" in v && v.jurisdiction !== undefined) {
+    if (typeof v.jurisdiction !== "string") {
+      return reject(`${field}.jurisdiction`, "expected a string");
+    }
+  }
+  if ("sep12Id" in v && v.sep12Id !== undefined) {
+    if (typeof v.sep12Id !== "string") {
+      return reject(`${field}.sep12Id`, "expected a string");
+    }
+  }
+  const party: PartyRef = {
+    id: v.id,
+    ...(typeof v.jurisdiction === "string" ? { jurisdiction: v.jurisdiction } : {}),
+    ...(typeof v.sep12Id === "string" ? { sep12Id: v.sep12Id } : {}),
+  };
+  return ok(party);
+}
+
+/**
+ * Parse POST /payments bodies strictly, replacing the old `isPaymentBody`
+ * six-field spot check, which only proved six properties were strings and
+ * then handed the rest to the engine. Every field is bounded, every shape is
+ * named, unknown top-level keys are refused, and a failure always carries
+ * `{field, reason}` so the caller fixes the one input at fault instead of
+ * guessing. Reasons stay free of anchor internals (same rule the engine's
+ * error mapping follows): field names and bounds, never upstream URLs or
+ * response bodies.
+ */
+export function parsePaymentBody(o: unknown): Outcome<PaymentIntent, PaymentBodyError> {
+  if (!isPlainObject(o)) {
+    return reject("<body>", "expected a JSON object");
+  }
+  for (const key of Object.keys(o)) {
+    if (!PAYMENT_FIELDS.has(key)) {
+      return reject(key, "unknown field");
+    }
+  }
+
+  const idempotencyKey = o.idempotencyKey;
+  if (typeof idempotencyKey !== "string") {
+    return reject("idempotencyKey", "expected a string");
+  }
+  if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    return reject("idempotencyKey", "must be 1-128 characters of [A-Za-z0-9._:-]");
+  }
+  if (idempotencyKey.length > MAX_IDEMPOTENCY_KEY) {
+    return reject("idempotencyKey", `must be at most ${MAX_IDEMPOTENCY_KEY} characters`);
+  }
+
+  const corridorId = o.corridorId;
+  if (typeof corridorId !== "string") {
+    return reject("corridorId", "expected a string");
+  }
+  if (corridorId.length === 0 || corridorId.length > MAX_CORRIDOR_ID) {
+    return reject("corridorId", `must be 1-${MAX_CORRIDOR_ID} characters`);
+  }
+
+  const senderParty = parseParty(o.sender, "sender");
+  if (!senderParty.ok) return senderParty;
+  const recipientParty = parseParty(o.recipient, "recipient");
+  if (!recipientParty.ok) return recipientParty;
+  const sender = senderParty.value;
+  const recipient = recipientParty.value;
+
+  const rawSourceAmount = o.sourceAmount;
+  if (!isPlainObject(rawSourceAmount)) {
+    return reject("sourceAmount", "expected an object with asset and amount strings");
+  }
+  if (typeof rawSourceAmount.asset !== "string") {
+    return reject("sourceAmount.asset", "expected a string");
+  }
+  if (rawSourceAmount.asset.length === 0) {
+    return reject("sourceAmount.asset", "must not be empty");
+  }
+  if (typeof rawSourceAmount.amount !== "string") {
+    return reject("sourceAmount.amount", "expected a string");
+  }
+  const sourceAmount = { asset: rawSourceAmount.asset, amount: rawSourceAmount.amount };
+
+  let destinationFields: Record<string, string> | undefined;
+  if ("destinationFields" in o && o.destinationFields !== undefined) {
+    const df = o.destinationFields;
+    if (!isPlainObject(df)) {
+      return reject(
+        "destinationFields",
+        "expected a flat object of string values (Record<string,string>)",
+      );
+    }
+    const keys = Object.keys(df);
+    if (keys.length > MAX_DESTINATION_FIELD_KEYS) {
+      return reject(
+        "destinationFields",
+        `must have at most ${MAX_DESTINATION_FIELD_KEYS} keys`,
+      );
+    }
+    destinationFields = {};
+    for (const key of keys) {
+      const value = df[key];
+      if (typeof value !== "string") {
+        return reject(`destinationFields.${key}`, "expected a string value");
+      }
+      if (value.length > MAX_DESTINATION_FIELD_VALUE) {
+        return reject(
+          `destinationFields.${key}`,
+          `must be at most ${MAX_DESTINATION_FIELD_VALUE} characters`,
+        );
+      }
+      destinationFields[key] = value;
+    }
+  }
+
+  return ok({
+    idempotencyKey,
+    corridorId,
+    sender,
+    recipient,
+    sourceAmount,
+    ...(destinationFields ? { destinationFields } : {}),
+  });
+}
+
+/** Asset the body must name: what the sender puts in, i.e. the corridor's
+ *  source asset / bridge asset. Checked AFTER the corridor is looked up, so it
+ *  compares against the manifest rather than anything the caller supplied. */
+function assetMatchesCorridor(asset: string, corridor: Corridor): boolean {
+  return asset === corridor.source.asset || asset === corridor.settlement.bridge_asset;
 }
 
 function bearer(headers?: Record<string, string>): string | undefined {
@@ -230,6 +450,16 @@ export interface Service {
   route(req: RouteRequest): Promise<RouteResponse>;
   /** A node:http server that delegates to route(). Call .listen(port). */
   server(): ReturnType<typeof httpCreateServer>;
+  /**
+   * Signal the service to start draining. After this call:
+   * - `GET /readyz` returns 503 immediately (load balancers stop routing).
+   * - New `POST /payments` return 503 `{error:"draining"}`.
+   * - In-flight `execute()` calls are allowed to finish.
+   * Returns a Promise that resolves once all in-flight executions have settled.
+   */
+  drain(): Promise<void>;
+  /** Idempotency keys of the `execute()` calls still running right now. */
+  inFlightKeys(): string[];
 }
 
 export function createService(options: ServiceOptions): Service {
@@ -238,6 +468,28 @@ export function createService(options: ServiceOptions): Service {
     options.rateLimiter ??
     (options.rateLimit ? new TokenBucket(options.rateLimit, now) : undefined);
   const cbVerifier = new CallbackVerifier();
+  const readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+
+  // --- draining state --------------------------------------------------
+  // Set true by drain(). Once set it is never cleared: a draining instance
+  // keeps its load-balancer weight at zero and rejects new payments until the
+  // process exits.
+  let draining = false;
+
+  // Track every in-flight execute() promise so drain() can wait for them all.
+  // Keys are idempotency keys (for logging on grace-timer fire).
+  const inFlight = new Map<string, Promise<unknown>>();
+
+  function trackExecution(idempotencyKey: string, p: Promise<unknown>): void {
+    inFlight.set(idempotencyKey, p);
+    void p.finally(() => inFlight.delete(idempotencyKey));
+  }
+
+  function drain(): Promise<void> {
+    draining = true;
+    if (inFlight.size === 0) return Promise.resolve();
+    return Promise.all([...inFlight.values()]).then(() => undefined);
+  }
 
   // Rate-limit identity: a VALIDATED API key if present (most specific), else
   // the client IP resolved by the transport.
@@ -259,9 +511,39 @@ export function createService(options: ServiceOptions): Service {
     const headers = req.headers ?? {};
     const path = req.path.replace(/\/+$/, "") || "/";
 
-    // Health is public and unmetered.
+    // Health is public and unmetered. Always 200 — liveness only.
     if (req.method === "GET" && path === "/healthz") {
       return { status: 200, body: { status: "ok" } };
+    }
+
+    // Readiness is public and unmetered. Returns 503 while draining or when any
+    // check fails, 200 when all checks pass. The body lists per-check results but
+    // never surfaces internal error messages — no anchor URLs, no stack traces.
+    if (req.method === "GET" && path === "/readyz") {
+      if (draining) {
+        return { status: 503, body: { status: "draining", checks: [] } };
+      }
+      const checks = options.readinessChecks ?? [];
+      const results = await Promise.all(
+        checks.map(async ({ name, check }) => {
+          try {
+            await Promise.race([
+              check(),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("timeout")), readinessTimeoutMs),
+              ),
+            ]);
+            return { name, ok: true };
+          } catch {
+            return { name, ok: false };
+          }
+        }),
+      );
+      const allOk = results.every((r) => r.ok);
+      return {
+        status: allOk ? 200 : 503,
+        body: { status: allOk ? "ok" : "degraded", checks: results },
+      };
     }
 
     // Metrics are public and unmetered (scrapers don't carry an API key). Only
@@ -294,20 +576,78 @@ export function createService(options: ServiceOptions): Service {
 
     // --- POST /payments ---
     if (req.method === "POST" && path === "/payments") {
-      if (!isPaymentBody(req.body)) {
-        return { status: 400, body: { error: "invalid payment body" } };
+      // Refuse new payments while draining. In-flight ones that already started
+      // will run to completion; only new arrivals are blocked.
+      if (draining) {
+        return { status: 503, body: { error: "draining" } };
       }
-      const intent = req.body;
+      const parsed = parsePaymentBody(req.body);
+      if (!parsed.ok) {
+        // Always with `{field, reason}`: a bare "invalid payment body" left
+        // callers guessing which of their inputs the engine objected to.
+        return {
+          status: 400,
+          body: {
+            error: "invalid payment body",
+            field: parsed.error.field,
+            reason: parsed.error.reason,
+          },
+        };
+      }
+      const intent = parsed.value;
       // isSettleableAmount, not isValidAmount: the latter is a signed syntax
       // check (subAmounts needs negatives) and let "-100.00" through to the
       // engine, which settled it.
       if (!isSettleableAmount(intent.sourceAmount.amount)) {
         return {
           status: 422,
-          body: { error: "AMOUNT_INVALID", message: "amount must be a positive decimal" },
+          body: {
+            error: "AMOUNT_INVALID",
+            field: "sourceAmount.amount",
+            message: "amount must be a positive decimal",
+          },
         };
       }
       const corridor = options.corridors.get(intent.corridorId);
+      if (!corridor) {
+        return {
+          status: 404,
+          body: { error: "unknown corridor", corridorId: intent.corridorId },
+        };
+      }
+      // Asset match AFTER the corridor lookup: the body says what asset it
+      // claims to be denominated in, the manifest is the authority on what this
+      // lane actually settles. Without this, a body naming the wrong asset was
+      // accepted and handed to the anchor to discover at quote time.
+      if (!assetMatchesCorridor(intent.sourceAmount.asset, corridor)) {
+        return {
+          status: 422,
+          body: {
+            error: "AMOUNT_INVALID",
+            field: "sourceAmount.asset",
+            message: "asset does not match the corridor's source or bridge asset",
+          },
+        };
+      }
+      // Owner comes from the VALIDATED bearer, never from the body — a client
+      // must not be able to claim another tenant's runs by asking.
+      const p = execute(intent, corridor, options.deps, { owner: presentedKey });
+      trackExecution(intent.idempotencyKey, p);
+      const result = await p;
+      if (result.ok) {
+        return { status: 200, body: result.value };
+      }
+      return {
+        status: STATUS_BY_CODE[result.error.code] ?? 500,
+        body: { error: result.error.code, message: result.error.message },
+      };
+    }
+
+    // --- POST /callbacks/sep31/:corridorId ---
+    const cbMatch = path.match(/^\/callbacks\/sep31\/([^/]+)$/);
+    if (req.method === "POST" && cbMatch) {
+      const corridorId = decodeURIComponent(cbMatch[1]);
+      const corridor = options.corridors.get(corridorId);
       if (!corridor) {
         return { status: 404, body: { error: "unknown corridor" } };
       }
@@ -395,5 +735,189 @@ export function createService(options: ServiceOptions): Service {
     });
   }
 
-  return { route, server };
+  return { route, server, drain, inFlightKeys: () => [...inFlight.keys()] };
+}
+
+/** Extract a bearer token from an Authorization header, if present. */
+function bearer(headers: Record<string, string> | undefined): string | undefined {
+  const auth = headers?.["authorization"];
+  return auth?.startsWith("Bearer ") ? auth.slice(7) : undefined;
+}
+
+/** `Set.has()` short-circuits on hash-bucket lookup, which leaks timing
+ *  about the presented key. Iterate and compare every candidate in constant
+ *  time instead — the set of configured API keys is small (operator-sized,
+ *  not user-sized), so this stays cheap. */
+function matchesKey(keys: Set<string> | undefined, presented: string | undefined): boolean {
+  if (!keys || !presented) return false;
+  let matched = false;
+  for (const key of keys) {
+    if (constantTimeEqual(key, presented)) matched = true;
+  }
+  return matched;
+}
+
+/** Same constant-time treatment for the ownership check on GET /payments/:key. */
+function ownerMatches(owner: string | undefined, presented: string | undefined): boolean {
+  if (owner === undefined || presented === undefined) return false;
+  return constantTimeEqual(owner, presented);
+}
+
+/** `lastError` is stored as "CODE: message". Surface only the code — the message
+ *  carries anchor URLs and upstream response text that must not leave the box. */
+function errorCode(lastError: string | undefined): string | undefined {
+  if (!lastError) return undefined;
+  const idx = lastError.indexOf(":");
+  return idx > 0 ? lastError.slice(0, idx) : lastError;
+}
+
+/** First hop in an X-Forwarded-For list (the original client). */
+function firstForwarded(xff: string | undefined): string | undefined {
+  const first = xff?.split(",")[0]?.trim();
+  return first || undefined;
+}
+
+/**
+ * Resolve the client IP for rate-limit keying. With `trustProxy`, prefer the
+ * left-most X-Forwarded-For entry set by a trusted ingress; otherwise use the
+ * socket peer address, which a client cannot forge.
+ */
+function resolveClientIp(
+  incoming: IncomingMessage,
+  headers: Record<string, string>,
+  trustProxy: boolean,
+): string | undefined {
+  if (trustProxy) {
+    const fwd = firstForwarded(headers["x-forwarded-for"]);
+    if (fwd) return fwd;
+  }
+  return incoming.socket?.remoteAddress ?? undefined;
+}
+
+/**
+ * Stop accepting new connections and drain in-flight requests, then force-close
+ * any that outlast the grace period. Wire this to SIGTERM/SIGINT in your entry
+ * point so a deploy/rollout doesn't sever an in-flight payment mid-settle:
+ *
+ *   const svc = createService(opts);
+ *   const srv = svc.server();
+ *   srv.listen(8080);
+ *   for (const sig of ["SIGTERM", "SIGINT"] as const) {
+ *     process.on(sig, () => void gracefulShutdown(srv, svc).then(() => process.exit(0)));
+ *   }
+ *
+ * Pass `svc` as the second argument so the shutdown sequence:
+ *   1. Signals the service to drain — `/readyz` immediately returns 503 and new
+ *      POST /payments are rejected, stopping the load balancer from routing new
+ *      traffic while existing payments finish.
+ *   2. Waits for all in-flight `execute()` calls to settle.
+ *   3. Stops the HTTP server from accepting new connections and closes idle sockets.
+ *   4. Force-closes any remaining connections once the grace window expires,
+ *      logging the idempotency keys still running so operators can investigate.
+ */
+export function gracefulShutdown(
+  srv: ReturnType<typeof httpCreateServer>,
+  svcOrOpts?: Service | { graceMs?: number },
+  legacyOpts: { graceMs?: number } = {},
+): Promise<void> {
+  // Support both old signature gracefulShutdown(srv, opts) and new
+  // gracefulShutdown(srv, svc, opts) so existing callers keep working.
+  let svc: Service | undefined;
+  let opts: { graceMs?: number };
+  if (svcOrOpts && "drain" in svcOrOpts) {
+    svc = svcOrOpts as Service;
+    opts = legacyOpts;
+  } else {
+    svc = undefined;
+    opts = (svcOrOpts as { graceMs?: number } | undefined) ?? {};
+  }
+
+  const graceMs = opts.graceMs ?? 10_000;
+
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+
+    // 1. Tell the service to drain — /readyz goes 503 and new payments are
+    //    blocked immediately, before we wait for anything.
+    if (svc) void svc.drain();
+
+    // 2. Stop accepting new HTTP connections; wait for existing ones to close.
+    srv.close(() => done());
+    // Free idle keep-alive sockets so srv.close() can complete promptly.
+    srv.closeIdleConnections?.();
+
+    // 3. Backstop: after the grace window, force-close everything still open.
+    const timer = setTimeout(() => {
+      // Log the keys still running so operators know what was mid-settle when we cut.
+      if (svc) {
+        const keys = svc.inFlightKeys();
+        process.stderr.write(
+          `[corridor/service] graceful-shutdown grace period (${graceMs}ms) expired, ` +
+            `force-closing connections. In-flight idempotency keys: ` +
+            `${keys.length > 0 ? keys.join(", ") : "none"}\n`,
+        );
+      }
+      srv.closeAllConnections?.();
+      done();
+    }, graceMs);
+    timer.unref?.();
+  });
+}
+
+function decodeBase32(str: string): Buffer {
+  const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const buf = Buffer.alloc(Math.ceil((str.length * 5) / 8));
+  let bits = 0,
+    val = 0,
+    idx = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === "=") break;
+    val = (val << 5) | ALPHABET.indexOf(str[i]);
+    bits += 5;
+    if (bits >= 8) {
+      buf[idx++] = (val >>> (bits - 8)) & 255;
+      bits -= 8;
+    }
+  }
+  return buf.subarray(0, idx);
+}
+
+export class CallbackVerifier {
+  private readonly keys = new Map<string, { key: crypto.KeyObject; expires: number }>();
+
+  async verify(
+    homeDomain: string,
+    payload: Buffer,
+    signatureBase64: string,
+  ): Promise<boolean> {
+    const now = Date.now();
+    let cached = this.keys.get(homeDomain);
+    if (!cached || cached.expires < now) {
+      try {
+        const res = await fetch(`https://${homeDomain}/.well-known/stellar.toml`);
+        if (!res.ok) return false;
+        const text = await res.text();
+        const match = text.match(/^SIGNING_KEY\s*=\s*"([^"]+)"/m);
+        if (!match) return false;
+        const rawPub = decodeBase32(match[1]).subarray(1, 33);
+        const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), rawPub]);
+        const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+        cached = { key, expires: now + 5 * 60_000 };
+        this.keys.set(homeDomain, cached);
+      } catch {
+        return false;
+      }
+    }
+    try {
+      return crypto.verify(null, payload, cached.key, Buffer.from(signatureBase64, "base64"));
+    } catch {
+      return false;
+    }
+  }
 }

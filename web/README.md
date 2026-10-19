@@ -32,9 +32,12 @@ pnpm build
 ## How it talks to the engine
 
 By default the **Run a payment** page calls a local API route
-(`app/api/payments/route.ts`) that drives a **demo-only** simulation of
-`@corridor/engine` (`lib/engine-sim.ts`) — same state machine and idempotency
-rules, but a re-implementation that can drift, so it is not a source of truth.
+(`app/api/payments/route.ts`) that invokes the real `@corridor/engine` with
+in-memory mock anchor and settlement adapters. The scenario selector exercises
+the happy path, quote expiry, settlement retries, and reconciliation recovery;
+no live anchor endpoints or funds are used. `web/` keeps its own pnpm lockfile
+but resolves engine, adapter-kit, manifest, router, and types from their source
+using `tsconfig.json` paths and Next's `transpilePackages`.
 
 To drive the **real** engine, run `@corridor/service` and set:
 
@@ -44,4 +47,5 @@ CORRIDOR_SERVICE_API_KEY=…                        # optional; if the service r
 ```
 
 When `CORRIDOR_SERVICE_URL` is set the route forwards to the real service and
-relays its response (and the simulation is bypassed entirely).
+relays its response; the demo-only scenario field is removed from the proxied
+request.

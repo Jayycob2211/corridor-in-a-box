@@ -22,6 +22,7 @@ import {
   InMemoryIdempotencyStore,
   consoleLogger,
   execute,
+  type DryRunReport,
   type EngineDeps,
   type GateCheck,
   type RunResult,
@@ -367,6 +368,8 @@ export interface ExecuteCanaryOptions {
   skipDoctor?: boolean;
   anchorUrl?: string;
   idempotencyKey?: string;
+  /** Stop after the pre-settle gate; never submit the settle payment. */
+  dryRun?: boolean;
 }
 
 export interface CanaryRunResult {
@@ -375,6 +378,8 @@ export interface CanaryRunResult {
   transactionId?: string;
   stellarTxHash?: string;
   error?: string;
+  /** Gate results of a dry run that passed the gate. Never set alongside `run`. */
+  dryRun?: DryRunReport;
   /** Terminal run result and the settlement the submitter was asked to make; set on a completed run. */
   run?: RunResult;
   settlement?: SettlementRequest;
@@ -557,7 +562,7 @@ export async function executeCanary(
     `  intent:  ${intent.idempotencyKey} (${opts.amount} ${corridor.settlement.bridge_asset})\n`,
   );
 
-  const result = await execute(intent, corridor, deps);
+  const result = await execute(intent, corridor, deps, { dryRun: opts.dryRun });
 
   const trail =
     audit.entries.length > 0
@@ -577,6 +582,20 @@ export async function executeCanary(
     console.log(
       `explorer:       https://stellar.expert/explorer/${corridor.settlement.network}/tx/${stellarTx}`,
     );
+  }
+
+  if (!result.ok && opts.dryRun && result.error.code === "DRY_RUN_COMPLETE") {
+    const report = result.error.cause as DryRunReport;
+    console.log(`\n✓ dry run passed the pre-settle gate; nothing was submitted`);
+    for (const c of report.checks) {
+      console.log(`  ✓ ${c.name} (${c.durationMs}ms) ${c.detail}`);
+    }
+    if (txId) {
+      console.log(
+        `  anchor transaction ${txId} stays unfunded and expires on the anchor's side`,
+      );
+    }
+    return { exitCode: EXIT_OK, trail, transactionId: txId, dryRun: report };
   }
 
   if (!result.ok) {

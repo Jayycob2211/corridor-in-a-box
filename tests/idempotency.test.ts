@@ -237,6 +237,8 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         refund_id: params[13],
         last_error: params[14],
         owner: params[15],
+        settlement: params[16],
+        manifest_hash: params[17],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -253,6 +255,7 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         table.set(key, {
           ...incoming,
           refund_id: current?.refund_id ?? incoming.refund_id,
+          manifest_hash: current?.manifest_hash ?? incoming.manifest_hash,
         });
       }
       return { rows: [] as R[] };
@@ -399,6 +402,7 @@ describe("refund state round-trips", () => {
       "quote_firm",
       "settlement_amount",
       "deposit_address",
+      "manifest_hash",
     ]) {
       expect(seen[0]).toContain(column);
       expect(seen.slice(1).join("\n")).toContain(`add column if not exists ${column}`);
@@ -533,5 +537,22 @@ describe("PostgresIdempotencyStore", () => {
     const got = await store.get("k");
     expect(got?.state).toBe("reconciled");
     expect(got?.version).toBe(6);
+  });
+
+  it("round-trips manifestHash", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    const run: StoredRun = {
+      idempotencyKey: "k-hash",
+      corridorId: "c",
+      state: "opened",
+      version: 1,
+      manifestHash: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+    };
+    await store.create(run);
+    const got = await store.get("k-hash");
+    expect(got?.manifestHash).toBe(
+      "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+    );
   });
 });

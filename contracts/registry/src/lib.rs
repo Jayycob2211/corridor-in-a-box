@@ -33,6 +33,41 @@
 //!
 //! Writes are restricted to a single configured attester contract, which holds
 //! the authorisation policy. See the `attester` crate.
+//!
+//! ## Storage lifetime
+//!
+//! Soroban persistent and instance entries expire after their TTL and are then
+//! archived: a read of an archived entry fails until someone restores it. Every
+//! write here therefore extends the entry it touched, and the contract instance
+//! (which holds `Admin`, `Attester` and the `domains()` list, and whose expiry
+//! takes the whole contract offline), by the constants below. `bump(domain)` lets
+//! anyone keep a record alive without re-attesting it, so an anchor that is no
+//! longer attested (say, one removed from `contracts/anchors.json`) is not
+//! archived just because nobody wrote to it. `bump` does not change
+//! `attested_ledger`: the record stays exactly as old as it was.
+//!
+//! The extension is capped by the network's maximum entry TTL, and an entry only
+//! lives that long if something touches it again before then. Calling `bump` for
+//! every registered domain at least once per `TTL_THRESHOLD` window is enough.
+//!
+//! ### Restoring an archived entry
+//!
+//! `bump` cannot revive an entry that has already been archived: the network
+//! rejects any transaction that touches one. Submit a `RestoreFootprint`
+//! operation for the archived key first (the Stellar CLI wraps it as
+//! `stellar contract restore`; see its `--help` for the key flags), which brings
+//! the entry back live, and then call `bump(domain)` to extend it again. Restoring
+//! the contract instance the same way brings back `Admin`, `Attester` and
+//! `domains()`.
+//!
+//! ## Migration
+//!
+//! When updating the registry contract in place via `upgrade()` (see `upgrade`
+//! in the implementation below), existing anchor records are retained as-is in
+//! storage. Because new probe bits are strictly appended, existing records
+//! maintain their validity and previous bit meanings. Old records written
+//! before new probes were added will read `serves_sep6 == false` until they are
+//! re-attested by an attester that runs the new probes.
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
@@ -51,12 +86,14 @@ pub const SEP_NUMBERS: [u32; 7] = [1, 6, 10, 12, 24, 31, 38];
 /// `PROBE_NAMES[i]`. Kept separate from `seps` because "the toml claims SEP-31"
 /// and "a SEP-31 call actually succeeded" are different facts, and conflating
 /// them is how a registry starts asserting things nobody verified.
-pub const PROBE_NAMES: [&str; 5] = [
+pub const PROBE_NAMES: [&str; 7] = [
     "toml_fetch",   // stellar.toml fetched and parsed
     "sep10_auth",   // full SEP-10 challenge/response produced a JWT
     "sep38_quote",  // a firm SEP-38 quote came back with a future expiry
     "sep12_status", // SEP-12 customer status was readable
     "sep31_info",   // SEP-31 GET /info listed at least one receivable asset
+    "sep6_info",    // SEP-6 GET /info listed at least one withdraw asset
+    "sep6_auth",    // SEP-6 authenticated read succeeded
 ];
 
 /// Upper bound on registered domains. An unbounded list is an unbounded read
@@ -64,6 +101,18 @@ pub const PROBE_NAMES: [&str; 5] = [
 /// whoever crosses the threshold. Raise it deliberately via an upgrade if the
 /// ecosystem outgrows it rather than discovering the limit in production.
 pub const MAX_DOMAINS: u32 = 512;
+
+/// Ledgers close about every 5 seconds.
+pub const LEDGERS_PER_DAY: u32 = 17_280;
+
+/// An entry is only extended when its remaining TTL has fallen below this, so a
+/// burst of writes pays for one extension rather than one each. 30 days.
+pub const TTL_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
+
+/// What a write or `bump` extends an entry to. 90 days: comfortably inside the
+/// network's maximum entry TTL (an extension past it is an error, not a clamp),
+/// and three times the threshold so that a write always buys a real extension.
+pub const TTL_EXTEND_TO: u32 = 90 * LEDGERS_PER_DAY;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +167,41 @@ pub enum Error {
 const SEP_MASK: u32 = (1u32 << SEP_NUMBERS.len()) - 1;
 const PROBE_MASK: u32 = (1u32 << PROBE_NAMES.len()) - 1;
 
+pub const fn sep_bit(sep: u32) -> Option<u32> {
+    let mut i = 0;
+    while i < SEP_NUMBERS.len() {
+        if SEP_NUMBERS[i] == sep {
+            return Some(1u32 << i);
+        }
+        i += 1;
+    }
+    None
+}
+
+pub const fn probe_bit(name: &str) -> Option<u32> {
+    let mut i = 0;
+    while i < PROBE_NAMES.len() {
+        let a = PROBE_NAMES[i].as_bytes();
+        let b = name.as_bytes();
+        if a.len() == b.len() {
+            let mut j = 0;
+            let mut eq = true;
+            while j < a.len() {
+                if a[j] != b[j] {
+                    eq = false;
+                    break;
+                }
+                j += 1;
+            }
+            if eq {
+                return Some(1u32 << i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Emitted on every accepted attestation, so indexers and dashboards can follow
 /// the registry without polling every key.
 ///
@@ -139,6 +223,21 @@ pub struct Attested {
     pub attester: Address,
 }
 
+/// Keeps the contract instance (its `Admin`, `Attester` and `Domains`, and its
+/// code) alive. Called from every path that writes instance storage.
+fn extend_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Keeps one anchor record alive.
+fn extend_record(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
 #[contract]
 pub struct Registry;
 
@@ -152,6 +251,7 @@ impl Registry {
         env.storage()
             .instance()
             .set(&DataKey::Domains, &Vec::<String>::new(&env));
+        extend_instance(&env);
     }
 
     /// Record (or replace) the attestation for a domain.
@@ -212,6 +312,8 @@ impl Registry {
             attester: attester.clone(),
         };
         env.storage().persistent().set(&key, &record);
+        extend_record(&env, &key);
+        extend_instance(&env);
 
         Attested {
             domain,
@@ -223,6 +325,23 @@ impl Registry {
             attester,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Extend the lifetime of a record, and of the contract instance, without
+    /// re-attesting. Permissionless on purpose: keeping a fact readable costs the
+    /// caller a fee and changes nothing, `attested_ledger` included, so there is
+    /// nothing to protect and no reason to make a dashboard ask the attester.
+    ///
+    /// Cannot revive an entry that is already archived; see "Restoring an
+    /// archived entry" in the header.
+    pub fn bump(env: Env, domain: String) -> Result<(), Error> {
+        let key = DataKey::Anchor(domain);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        extend_record(&env, &key);
+        extend_instance(&env);
         Ok(())
     }
 
@@ -269,10 +388,27 @@ impl Registry {
     /// Whether the domain both advertises SEP-31 and passed the SEP-31 probe.
     /// The question an operator actually has, answered without a decoder ring.
     pub fn serves_sep31(env: Env, domain: String) -> Result<bool, Error> {
+        Self::serves(env, domain, 31)
+    }
+
+    /// Whether the domain both advertises SEP-6 and passed the sep6_info probe.
+    pub fn serves_sep6(env: Env, domain: String) -> Result<bool, Error> {
+        Self::serves(env, domain, 6)
+    }
+
+    /// Generic query: whether the domain advertises the given SEP and passed
+    /// its defined probe. Returns false for SEPs with no defined probe.
+    pub fn serves(env: Env, domain: String, sep: u32) -> Result<bool, Error> {
         let r = Self::get_anchor(env, domain)?;
-        let sep31_bit = 1u32 << 5; // index of 31 in SEP_NUMBERS
-        let probe_bit = 1u32 << 4; // index of sep31_info in PROBE_NAMES
-        Ok(r.seps & sep31_bit != 0 && r.probes_passed & probe_bit != 0)
+        let (sep_bit, probe_bit) = match sep {
+            31 => (sep_bit(31), probe_bit("sep31_info")),
+            6 => (sep_bit(6), probe_bit("sep6_info")),
+            _ => return Ok(false),
+        };
+        let (Some(sb), Some(pb)) = (sep_bit, probe_bit) else {
+            return Ok(false);
+        };
+        Ok(r.seps & sb != 0 && r.probes_passed & pb != 0)
     }
 
     pub fn admin(env: Env) -> Result<Address, Error> {
@@ -293,6 +429,7 @@ impl Registry {
     pub fn set_attester(env: Env, attester: Address) -> Result<(), Error> {
         Self::admin(env.clone())?.require_auth();
         env.storage().instance().set(&DataKey::Attester, &attester);
+        extend_instance(&env);
         Ok(())
     }
 

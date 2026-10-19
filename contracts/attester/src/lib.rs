@@ -27,6 +27,20 @@
 //! every ledger, which both burns fees and destroys the freshness signal the
 //! registry exists to provide — `attested_ledger` would always be "now" and
 //! would tell a consumer nothing.
+//!
+//! ## Storage lifetime
+//!
+//! Soroban persistent and instance entries expire after their TTL and are then
+//! archived. Every write here extends the entry it touched (an enrolment, a
+//! domain's cooldown marker) and the contract instance (`Admin`, `Registry`,
+//! `MinInterval`, whose expiry takes the contract offline), by the constants
+//! below. `attest` also extends the signer's own enrolment, so an attester that
+//! keeps attesting never lapses. An enrolled attester that goes quiet for longer
+//! than the TTL does lapse, and `is_attester` then fails for it; the admin
+//! restores the entry (or simply calls `add_attester` again once it is restored)
+//! to bring it back. Restoring an archived entry is a `RestoreFootprint`
+//! operation, which the Stellar CLI wraps as `stellar contract restore`; see the
+//! registry crate's header for the details, which apply here unchanged.
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address,
@@ -84,6 +98,19 @@ pub enum Error {
     InvalidDomain = 4,
 }
 
+/// Ledgers close about every 5 seconds.
+pub const LEDGERS_PER_DAY: u32 = 17_280;
+
+/// An entry is only extended once its remaining TTL has fallen below this, so a
+/// burst of writes pays for one extension rather than one each. 30 days. Kept in
+/// step with the registry's constant of the same name (this crate cannot depend
+/// on the registry's implementation, see the note on `RegistryInterface`).
+pub const TTL_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
+
+/// What a write extends an entry to. 90 days: inside the network's maximum entry
+/// TTL, where an extension past it is an error rather than a clamp.
+pub const TTL_EXTEND_TO: u32 = 90 * LEDGERS_PER_DAY;
+
 /// Guards against a caller writing an empty key or an unbounded blob into the
 /// registry's domain list, where it would be permanent and readable by everyone.
 const MAX_DOMAIN_LEN: u32 = 253; // RFC 1035 maximum hostname length.
@@ -94,6 +121,20 @@ pub struct Attested {
     #[topic]
     pub domain: String,
     pub attester: Address,
+}
+
+/// Keeps the contract instance (and its code) alive.
+fn extend_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Keeps one persistent entry (an enrolment or a cooldown marker) alive.
+fn extend_entry(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 #[contract]
@@ -110,6 +151,7 @@ impl Attester {
         env.storage()
             .instance()
             .set(&DataKey::MinInterval, &min_interval);
+        extend_instance(&env);
     }
 
     /// Submit an attestation for `domain`. Requires `attester`'s authorisation
@@ -164,6 +206,10 @@ impl Attester {
         );
 
         env.storage().persistent().set(&last_key, &now);
+        extend_entry(&env, &last_key);
+        // Signing in keeps the signer's own enrolment alive too.
+        extend_entry(&env, &DataKey::Attester(attester.clone()));
+        extend_instance(&env);
         Attested { domain, attester }.publish(&env);
         Ok(())
     }
@@ -177,17 +223,19 @@ impl Attester {
 
     pub fn add_attester(env: Env, who: Address) -> Result<(), Error> {
         Self::admin(env.clone())?.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Attester(who), &true);
+        let key = DataKey::Attester(who);
+        env.storage().persistent().set(&key, &true);
+        extend_entry(&env, &key);
+        extend_instance(&env);
         Ok(())
     }
 
     pub fn remove_attester(env: Env, who: Address) -> Result<(), Error> {
         Self::admin(env.clone())?.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Attester(who), &false);
+        let key = DataKey::Attester(who);
+        env.storage().persistent().set(&key, &false);
+        extend_entry(&env, &key);
+        extend_instance(&env);
         Ok(())
     }
 
@@ -196,6 +244,7 @@ impl Attester {
         env.storage()
             .instance()
             .set(&DataKey::MinInterval, &ledgers);
+        extend_instance(&env);
         Ok(())
     }
 

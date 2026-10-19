@@ -61,3 +61,17 @@ export {
   type AttestationSource,
   type RegistryResolverOptions,
 } from "./registry-resolver";
+
+// Deploy-time injection: load a RouteResolver module named in config (e.g.
+// CORRIDOR_RESOLVER_MODULE) instead of editing code. The module below the
+// seam stays private; the seam itself stays open.
+export {
+  loadResolver,
+  ResolverLoadError,
+  ROUTE_RESOLVER_API_VERSION,
+  type LoadResolverSpec,
+  type LoadResolverCtx,
+} from "./load";
+
+export { createAdapterRegistry } from "./adapters";
+export type { AdapterFactory, AdapterRegistry } from "./adapters";

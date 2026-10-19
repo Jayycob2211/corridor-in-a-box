@@ -1,0 +1,28 @@
+# Fast pre-commit checks on STAGED files only (no test run). Opt out for one command
+# with `LEFTHOOK=0 git commit ...`. CI still runs the full gate.
+pre-commit:
+  parallel: true
+  commands:
+    prettier:
+      # --ignore-unknown skips files prettier has no parser for (.rs, .toml, images)
+      # instead of failing the commit on them.
+      glob: "*.*"
+      run: pnpm exec prettier --write --ignore-unknown {staged_files}
+      stage_fixed: true
+    eslint:
+      glob: "*.{ts,tsx,js}"
+      run: pnpm exec eslint --fix {staged_files}
+      stage_fixed: true
+    gitleaks:
+      # Skipped with a warning when gitleaks is not installed.
+      run: |
+        if command -v gitleaks > /dev/null 2>&1; then
+          gitleaks git --staged --pre-commit --redact --no-banner -c .gitleaks.toml
+        else
+          echo "warning: gitleaks not installed, skipping secret scan. See https://github.com/gitleaks/gitleaks#installation"
+        fi
+    cargofmt:
+      glob: "contracts/**/*.rs"
+      # rustfmt formats the files; cargo fmt takes no file list.
+      run: rustfmt --edition 2021 {staged_files}
+      stage_fixed: true

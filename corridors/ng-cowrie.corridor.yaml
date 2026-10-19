@@ -1,6 +1,6 @@
 # Corridor — USD → Nigeria (NGN) via Cowrie Exchange, a real SEP-31 anchor.
 #
-# Unlike mx-example, every endpoint below is REAL. Confirmed 2026-08-11 by
+# Unlike mx-example, every endpoint below is REAL. Confirmed 2026-10-17 by
 # actually running `@corridor/probe` against cowrie.exchange's live production
 # API (see CHANGELOG.md): the URLs are copied verbatim from its published
 # stellar.toml, SEP-10 signed a challenge and got back a real JWT, SEP-12
@@ -14,7 +14,7 @@
 # `fx.quote_source` is `external`: there is no on-chain firm-quote path today,
 # only whatever off-protocol pricing Cowrie's own KYC'd integration exposes.
 id: ng-cowrie
-status_note: "REAL — Cowrie Exchange (Lagos, Nigeria), confirmed 2026-08-11. No SEP-38, no payment attempted, no business relationship in place."
+status_note: "REAL — Cowrie Exchange (Lagos, Nigeria), confirmed 2026-10-17. No SEP-38, no payment attempted, no business relationship in place."
 
 source:
   name: USD Sending Anchor
@@ -31,7 +31,7 @@ dest:
     transfer_server_sep31: https://api.cowrie.exchange/sep31/direct
     web_auth: https://api.cowrie.exchange/web_auth
     kyc_server: https://api.cowrie.exchange/kyc
-    endpoints_verified_at: "2026-08-11"
+    endpoints_verified_at: "2026-10-17"
 
 fx:
   path: ["USD", "USDC", "NGN"]

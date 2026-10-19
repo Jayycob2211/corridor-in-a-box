@@ -13,6 +13,15 @@ import type { CorridorState } from "./state";
 export interface StoredRun {
   readonly idempotencyKey: string;
   readonly corridorId: string;
+  /**
+   * SHA-256 hash of the validated corridor manifest under which the run started.
+   * On crash resume, the engine compares this to the current manifest hash:
+   * if changed before settlement, it fails closed with MANIFEST_CHANGED;
+   * if changed after settlement, it reconciles only and logs a warning.
+   * Undefined on legacy runs created before this field existed (which are
+   * permitted to resume under legacy behavior).
+   */
+  manifestHash?: string;
   state: CorridorState;
   version: number;
   transactionId?: string;

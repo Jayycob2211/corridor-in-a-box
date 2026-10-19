@@ -35,6 +35,7 @@ export const CREATE_TABLE_SQL = `
 create table if not exists corridor_runs (
   idempotency_key text primary key,
   corridor_id     text not null,
+  manifest_hash   text,
   state           text not null,
   version         integer not null,
   transaction_id  text,
@@ -83,6 +84,8 @@ const ALTER_TABLE_SQL = [
   `alter table corridor_runs add column if not exists quote_expires_at bigint;`,
   `alter table corridor_runs add column if not exists quote_firm boolean;`,
   `alter table corridor_runs add column if not exists settlement_amount text;`,
+  // Stable hash of the validated corridor manifest under which the run started.
+  `alter table corridor_runs add column if not exists manifest_hash text;`,
 ];
 
 export async function migrate(db: Queryable): Promise<void> {
@@ -103,6 +106,7 @@ export async function migrate(db: Queryable): Promise<void> {
 interface Row {
   idempotency_key: string;
   corridor_id: string;
+  manifest_hash: string | null;
   state: string;
   version: number;
   transaction_id: string | null;
@@ -124,6 +128,7 @@ function toRun(r: Row): StoredRun {
   return {
     idempotencyKey: r.idempotency_key,
     corridorId: r.corridor_id,
+    manifestHash: r.manifest_hash ?? undefined,
     state: r.state as CorridorState,
     version: r.version,
     transactionId: r.transaction_id ?? undefined,
@@ -146,6 +151,15 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
   constructor(private readonly db: Queryable) {}
 
   /**
+   * Cheap liveness probe: sends `SELECT 1` and resolves when the DB is
+   * reachable. Throws if the query fails or times out, so callers (e.g.
+   * `storeCheck`) can treat any throw as "store unavailable".
+   */
+  async ping(): Promise<void> {
+    await this.db.query("SELECT 1");
+  }
+
+  /**
    * Atomically claim a key for a new run. `ON CONFLICT DO NOTHING` makes the
    * insert a no-op when the key already exists; `RETURNING` then tells us whether
    * a row was actually written. A `false` return means another worker already
@@ -159,8 +173,8 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
          (idempotency_key, corridor_id, state, version, transaction_id,
           quote_id, quote_expires_at, quote_firm, settlement_amount,
           stellar_tx_hash, deposit_address, memo, memo_type,
-          refund_id, last_error, owner, settlement, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, now())
+          refund_id, last_error, owner, settlement, manifest_hash, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now())
        on conflict (idempotency_key) do nothing
        returning idempotency_key`,
       [
@@ -181,6 +195,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         run.lastError ?? null,
         run.owner ?? null,
         run.settlement ? JSON.stringify(run.settlement) : null,
+        run.manifestHash ?? null,
       ],
     );
     return res.rows.length > 0;
@@ -191,7 +206,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
       `select idempotency_key, corridor_id, state, version, transaction_id,
               quote_id, quote_expires_at, quote_firm, settlement_amount,
               stellar_tx_hash, deposit_address, memo, memo_type,
-              refund_id, last_error, owner, settlement
+              refund_id, last_error, owner, settlement, manifest_hash
          from corridor_runs where idempotency_key = $1`,
       [key],
     );
@@ -211,7 +226,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
     const limitParam = `$${params.length}`;
     const result = await this.db.query<Row>(
       `select idempotency_key, corridor_id, state, version, transaction_id,
-              quote_id, stellar_tx_hash, refund_id, last_error, owner
+              quote_id, stellar_tx_hash, refund_id, last_error, owner, manifest_hash
          from corridor_runs where state = $1 ${corridor}
         order by updated_at desc, idempotency_key asc limit ${limitParam}`,
       params,
@@ -285,9 +300,10 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
          (idempotency_key, corridor_id, state, version, transaction_id,
           quote_id, quote_expires_at, quote_firm, settlement_amount,
           stellar_tx_hash, deposit_address, memo, memo_type,
-          refund_id, last_error, owner, settlement, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, now())
+          refund_id, last_error, owner, settlement, manifest_hash, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now())
        on conflict (idempotency_key) do update set
+         manifest_hash   = coalesce(corridor_runs.manifest_hash, excluded.manifest_hash),
          state           = excluded.state,
          version         = excluded.version,
          transaction_id  = excluded.transaction_id,
@@ -322,6 +338,7 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         run.lastError ?? null,
         run.owner ?? null,
         run.settlement ? JSON.stringify(run.settlement) : null,
+        run.manifestHash ?? null,
       ],
     );
   }

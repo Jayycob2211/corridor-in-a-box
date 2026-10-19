@@ -95,13 +95,13 @@ describe("checkCompatibility", () => {
   it("fails when an adapter settlement kind is not covered by any strategy", () => {
     const caps: AdapterCapabilities = {
       ...validCaps,
-      settlement: ["stellar_payment", "offchain_bank_transfer"],
+      settlement: ["stellar_payment", "claimable_balance"],
     };
     const res = checkCompatibility(testCorridor(), caps, defaultStrategies);
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.error.code).toBe("CAPABILITY_MISMATCH");
-      expect(res.error.message).toContain("offchain_bank_transfer");
+      expect(res.error.message).toContain("claimable_balance");
     }
   });
 });

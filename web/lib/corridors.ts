@@ -86,7 +86,7 @@ export const corridors: Corridor[] = [
   {
     id: "ng-cowrie",
     status_note:
-      "REAL — Cowrie Exchange (Lagos, Nigeria), issuer of NGNT. Confirmed 2026-08-11 by " +
+      "REAL — Cowrie Exchange (Lagos, Nigeria), issuer of NGNT. Confirmed 2026-10-17 by " +
       "@corridor/probe against the anchor's live production API: SEP-10 challenge signed " +
       "and exchanged for a JWT, SEP-12 answered, and SEP-31 GET /info returned a non-empty " +
       "receive list (NGNT, USDC). No SEP-38 quote server is published, so pricing is " +
@@ -102,7 +102,7 @@ export const corridors: Corridor[] = [
         transfer_server_sep31: "https://api.cowrie.exchange/sep31/direct",
         web_auth: "https://api.cowrie.exchange/web_auth",
         kyc_server: "https://api.cowrie.exchange/kyc",
-        endpoints_verified_at: "2026-08-11",
+        endpoints_verified_at: "2026-10-17",
       },
     },
     fx: { path: ["USD", "USDC", "NGN"], quote_source: "external", who_holds_risk: "receiving_anchor", quote_ttl_seconds: 60 },
@@ -138,6 +138,8 @@ export interface Liveness {
   runnable: boolean;
   verifiedAt?: string;
   warnings: string[];
+  /** Steps not covered by endpoint verification (e.g. quote when quote_source=external). */
+  gaps: string[];
 }
 
 export const LIVENESS_LABEL: Record<LivenessState, string> = {
@@ -158,6 +160,7 @@ export const LIVENESS_LABEL: Record<LivenessState, string> = {
 // proof.max_age_days.
 export function liveness(c: Corridor, now: Date = new Date()): Liveness {
   const warnings: string[] = [];
+  const gaps: string[] = [];
   const endpoints = c.dest.endpoints;
   const verifiedAt = endpoints.endpoints_verified_at;
 
@@ -170,6 +173,13 @@ export function liveness(c: Corridor, now: Date = new Date()): Liveness {
   }
   if (c.fx.quote_source === "sep38" && !endpoints.quote_server) {
     warnings.push("fx.quote_source=sep38 but dest exposes no SEP-38 quote server — quotes will fail.");
+  }
+  if (c.fx.quote_source === "external") {
+    gaps.push("quote");
+    warnings.push(
+      "fx.quote_source=external requires an external quote provider to be wired by the operator; " +
+        "it is not covered by endpoints_verified_at.",
+    );
   }
   if (!endpoints.kyc_server) {
     warnings.push("dest has no SEP-12 KYC server — assuming 1:1 delivery with no per-customer KYC.");
@@ -218,6 +228,7 @@ export function liveness(c: Corridor, now: Date = new Date()): Liveness {
     runnable: state === "verified" || state === "proven",
     verifiedAt,
     warnings,
+    gaps,
   };
 }
 

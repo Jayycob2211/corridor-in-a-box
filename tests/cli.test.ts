@@ -253,7 +253,7 @@ describe("corridor CLI", () => {
     const r = run(["plan", "corridors/ng-cowrie.corridor.yaml"]);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("liveness: ✓ VERIFIED");
-    expect(r.stdout).toContain("2026-08-11");
+    expect(r.stdout).toContain("2026-10-17");
   });
 
   it("plan: prints the status_note when present", () => {
@@ -441,6 +441,19 @@ describe("corridor CLI", () => {
       const r3 = run(["canary", "corridors/reference.corridor.yaml", "--amount", "0"]);
       expect(r3.status).toBe(2);
       expect(r3.stderr).toContain("positive decimal amount");
+    });
+
+    it("argument validation: exits 2 when --dry-run is combined with --write", () => {
+      const r = run([
+        "canary",
+        "corridors/reference.corridor.yaml",
+        "--amount",
+        "1.00",
+        "--dry-run",
+        "--write",
+      ]);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain("--write records a completed payment");
     });
 
     it("argument validation: exits 2 when --network is invalid", () => {

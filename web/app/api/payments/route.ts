@@ -1,10 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
-import { runPayment } from "@/lib/engine-sim";
+import { runEngineDemoPayment, type PaymentScenario } from "@/lib/engine-demo";
 
-// web/ deliberately doesn't depend on any @corridor/* workspace package (see
-// the note in lib/registry.ts) — small, self-contained mirror rather than a
-// cross-package import, same reasoning as elsewhere in this app.
 function constantTimeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
@@ -15,9 +12,8 @@ function constantTimeEqual(a: string, b: string): boolean {
 // POST /api/payments — mirrors @corridor/service's POST /payments.
 //
 // Two modes:
-//   default            run the in-repo SIMULATION (lib/engine-sim.ts) so the
-//                      showcase works with zero backend. Demo-only; it is a
-//                      re-implementation and can drift from the real engine.
+//   default            run the real engine with in-memory mock adapters so the
+//                      showcase works with zero backend and moves no real funds.
 //   CORRIDOR_SERVICE_URL set
 //                      PROXY to a real @corridor/service instance.
 //
@@ -51,16 +47,26 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return NextResponse.json({ error: "invalid payment body" }, { status: 400 });
+  }
+
   const b = body as {
     corridorId?: string;
     sourceAmount?: { amount?: string };
     idempotencyKey?: string;
+    scenario?: unknown;
   };
-  if (!b.corridorId || !b.sourceAmount?.amount || !b.idempotencyKey) {
+  if (
+    typeof b.corridorId !== "string" ||
+    typeof b.sourceAmount?.amount !== "string" ||
+    !b.sourceAmount.amount ||
+    typeof b.idempotencyKey !== "string" ||
+    !b.idempotencyKey
+  ) {
     return NextResponse.json({ error: "invalid payment body" }, { status: 400 });
   }
-  // Bound the key length: it is a Map key with process lifetime in the
-  // simulation, and an unbounded one is free memory for anyone who asks.
+  // Bound caller-controlled IDs before they enter the process-local demo store.
   if (b.idempotencyKey.length > 128 || b.corridorId.length > 128) {
     return NextResponse.json({ error: "invalid payment body" }, { status: 400 });
   }
@@ -83,10 +89,27 @@ export async function POST(req: Request) {
     if (!presented || !constantTimeEqual(presented, `Bearer ${required}`)) {
       return NextResponse.json({ error: "unauthorized" }, { status: 401 });
     }
-    return proxyToService(serviceUrl, body);
+    const proxyBody = { ...(body as Record<string, unknown>) };
+    delete proxyBody.scenario;
+    return proxyToService(serviceUrl, proxyBody);
   }
 
-  const result = runPayment(b.corridorId, b.sourceAmount.amount, b.idempotencyKey);
+  const scenario = b.scenario ?? "happy";
+  if (
+    scenario !== "happy" &&
+    scenario !== "quote-expired" &&
+    scenario !== "settle-fails" &&
+    scenario !== "reconcile-stall"
+  ) {
+    return NextResponse.json({ error: "invalid payment scenario" }, { status: 400 });
+  }
+
+  const result = await runEngineDemoPayment(
+    b.corridorId,
+    b.sourceAmount.amount,
+    b.idempotencyKey,
+    scenario as PaymentScenario,
+  );
   return NextResponse.json(result, { status: 200 });
 }
 

@@ -29,9 +29,22 @@
   --accent: #3b82f6;
 }
 
+html {
+  /* The header is sticky; without this a focused or anchored element can be
+     scrolled to sit underneath it (WCAG 2.2 2.4.11 Focus Not Obscured). */
+  scroll-padding-top: 5rem;
+}
+
 body {
   color: var(--primary-text);
   background: var(--background);
+}
+
+/* One visible focus indicator for everything focusable (links, inputs, the
+   theme toggle). --accent is >= 4.5:1 against the page in both themes. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* Markdown prose for the docs pages. Kept small and dependency-free. */

@@ -8,6 +8,7 @@
 //   MANIFEST=corridors/reference.corridor.yaml
 //   DATABASE_URL=postgres://...            # optional; falls back to in-memory
 //   pnpm testnet
+//   pnpm testnet -- --dry-run            # stop after the pre-settle gate, submit nothing
 //
 // SAFETY: refuses to run a `public` (mainnet) corridor unless you set
 // CORRIDOR_ALLOW_MAINNET=1 — this moves real money. Read docs/key-management.md
@@ -16,7 +17,7 @@
 
 import { fileURLToPath } from "node:url";
 import { loadCorridor } from "@corridor/manifest";
-import { StaticRouteResolver } from "@corridor/router";
+import { StaticRouteResolver, createAdapterRegistry } from "@corridor/router";
 import { Sep31Adapter, sep31GateChecks } from "@corridor/sep31";
 import {
   LocalKeypairSigner,
@@ -95,7 +96,14 @@ async function main(): Promise<void> {
   const signer = LocalKeypairSigner.fromSecret(env("CORRIDOR_SIGNER_SECRET"));
   const horizonUrl = env("HORIZON_URL", "https://horizon-testnet.stellar.org");
 
-  const adapter = new Sep31Adapter(corridor, { sep10: new StellarSep10Signer(signer) });
+  const registry = createAdapterRegistry();
+  registry.register(
+    "sep31",
+    (c) => new Sep31Adapter(c, { sep10: new StellarSep10Signer(signer) }),
+  );
+  // Only "sep31" is registered, so any other protocol throws here with a clear error;
+  // what comes back is a Sep31Adapter, which the SEP-12 registration below needs.
+  const adapter = registry.adapterFor(corridor) as Sep31Adapter;
   const submitter = new StellarSettlementSubmitter({ signer, horizonUrl });
   const { store, close } = await buildStore();
   const audit = new InMemoryAuditLog();
@@ -198,9 +206,15 @@ async function main(): Promise<void> {
     `intent:     ${intent.idempotencyKey} (${intent.sourceAmount.amount} ${intent.sourceAmount.asset})\n`,
   );
 
+  const dryRun = process.argv.includes("--dry-run");
   try {
-    const result = await execute(intent, corridor, deps);
-    if (result.ok) {
+    const result = await execute(intent, corridor, deps, { dryRun });
+    if (dryRun && !result.ok && result.error.code === "DRY_RUN_COMPLETE") {
+      const checks = audit.entries.find((e) => e.to === "verifying")?.checks ?? [];
+      console.log("\n✓ dry run passed the pre-settle gate; nothing was submitted");
+      for (const c of checks) console.log(`  ✓ ${c.name}: ${c.detail}`);
+      console.log(`  ${result.error.message}`);
+    } else if (result.ok) {
       console.log("\n✓ payment completed");
       console.log(`  state:       ${result.value.state}`);
       console.log(`  stellar tx:  ${result.value.stellarTxHash}`);

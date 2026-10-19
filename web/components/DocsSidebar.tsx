@@ -8,7 +8,7 @@ import { docs } from "@/lib/docs";
 export function DocsSidebar() {
   const pathname = usePathname();
   return (
-    <nav className="flex flex-col gap-1">
+    <nav aria-label="Documentation" className="flex flex-col gap-1">
       <div className="mb-2 px-3 text-xs font-semibold uppercase tracking-wide text-secondary-text">
         Documentation
       </div>
@@ -19,10 +19,11 @@ export function DocsSidebar() {
           <Link
             key={d.slug}
             href={href}
+            aria-current={active ? "page" : undefined}
             className={clsx(
               "rounded-lg px-3 py-1.5 text-sm transition-colors",
               active
-                ? "bg-bg-subtle font-medium text-blue-600"
+                ? "bg-bg-subtle font-medium text-blue-600 dark:text-blue-400"
                 : "text-secondary-text hover:bg-bg-subtle hover:text-primary-text",
             )}
           >

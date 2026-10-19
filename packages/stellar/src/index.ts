@@ -8,9 +8,12 @@
 // SEP-31 settlement is a single NATIVE payment of the bridge asset to the
 // receiving anchor's deposit address — no smart contract involved.
 
+import { createHash } from "node:crypto";
 import {
   Asset,
   BASE_FEE,
+  Claimant,
+  getClaimableBalanceIdFromResult,
   Horizon,
   Keypair,
   Memo,
@@ -31,17 +34,21 @@ import {
   toScaled,
   type Outcome,
 } from "@corridor/types";
-import type {
-  ChainVerifier,
-  CheckResult,
-  GateCheck,
-  GateContext,
-  RefundRequest,
-  SettlementRef,
-  SettlementRequest,
-  SettlementSubmitter,
+import {
+  buildSettlementRequest,
+  type ChainVerifier,
+  type CheckResult,
+  type DepositInstructionsKind,
+  type GateCheck,
+  type GateContext,
+  type RefundRequest,
+  type SettlementRef,
+  type SettlementRequest,
+  type SettlementStrategy,
+  type SettlementStrategyContext,
+  type SettlementSubmitter,
 } from "@corridor/engine";
-import type { Sep10Signer } from "@corridor/sep31";
+import type { Sep10Signer } from "@corridor/adapter-kit";
 
 function passphraseFor(network: "public" | "testnet"): string {
   return network === "public" ? Networks.PUBLIC : Networks.TESTNET;
@@ -100,6 +107,9 @@ export class LocalKeypairSigner implements ExternalSigner {
     return this.keypair.sign(Buffer.from(data));
   }
 }
+
+export { assertSignerProducesValidSignatures } from "./signers/conformance";
+export { VaultTransitSigner, type VaultTransitSignerOptions } from "./signers/vault-transit";
 
 function isKeypair(s: ExternalSigner | Keypair): s is Keypair {
   // Keypair exposes publicKey() as a method; ExternalSigner as a string property.
@@ -161,6 +171,91 @@ export interface StellarSubmitterOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+class AsyncLock {
+  private lock: Promise<void> = Promise.resolve();
+
+  async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.lock;
+    let release: () => void = () => {};
+    this.lock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+/** Poll Horizon until the tx is in a ledger or we time out. Returns the ledger, feeCharged, and resultXdr. */
+async function confirmTransaction(
+  server: HorizonServerLike,
+  hash: string,
+  opts: {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    confirmTimeoutMs: number;
+  },
+): Promise<Outcome<{ ledger?: number; feeCharged?: string; resultXdr?: string }>> {
+  const deadline = opts.now() + opts.confirmTimeoutMs;
+  for (;;) {
+    try {
+      const tx = await server.transactions().transaction(hash).call();
+      if (tx.successful) {
+        return ok({
+          ledger: tx.ledger_attr ?? tx.ledger,
+          feeCharged: tx.fee_charged != null ? tx.fee_charged.toString() : undefined,
+          resultXdr: (tx as { result_xdr?: string }).result_xdr,
+        });
+      }
+      return fail("SETTLEMENT_FAILED", `tx ${hash} failed on-chain`);
+    } catch {
+      // not yet visible
+    }
+    if (opts.now() >= deadline) {
+      // NOT retryable-by-resubmission: the transaction may still land (or,
+      // on the happy path, may have already landed and Horizon's read side
+      // is just lagging), and sending a second one would risk a double
+      // payment. Timeout means "needs manual reconciliation," not "safe to
+      // retry" — mirrors packages/attester/src/index.ts's confirm().
+      return fail("SETTLEMENT_TIMEOUT", `tx ${hash} not confirmed within timeout`);
+    }
+    await opts.sleep(1_000);
+  }
+}
+
+function calculateClaimableBalanceId(
+  sourcePublicKey: string,
+  sequence: string | number,
+  opIndex = 0,
+): string {
+  const sourceAccount = Keypair.fromPublicKey(sourcePublicKey).rawPublicKey();
+  const seqBuf = Buffer.alloc(8);
+  seqBuf.writeBigInt64BE(BigInt(sequence));
+  const opIdxBuf = Buffer.alloc(4);
+  opIdxBuf.writeUInt32BE(opIndex);
+
+  const hasher = createHash("sha256");
+  hasher.update(sourceAccount);
+  hasher.update(seqBuf);
+  hasher.update(opIdxBuf);
+  return "00000000" + hasher.digest().toString("hex");
+}
+
+function extractClaimableBalanceId(resultXdr?: string): string | undefined {
+  if (!resultXdr) return undefined;
+  try {
+    return getClaimableBalanceIdFromResult(
+      xdr.TransactionResult.fromXdr(resultXdr, "base64"),
+      0,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Production settlement: build → sign → submit a native payment of the bridge
  * asset to the anchor's deposit address, then confirm it on Horizon.
@@ -186,7 +281,7 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
    *  submitTransaction() settles — NOT held through the (possibly 30s)
    *  confirm() poll, so one ambiguous submission doesn't head-of-line-block
    *  every other in-flight payment from this signer. */
-  private lock: Promise<void> = Promise.resolve();
+  private readonly lock = new AsyncLock();
 
   constructor(opts: StellarSubmitterOptions) {
     if (!opts.signer && !opts.signerSecret) {
@@ -213,17 +308,7 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this.lock;
-    let release: () => void = () => {};
-    this.lock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return this.lock.withLock(fn);
   }
 
   async submit(req: SettlementRequest): Promise<Outcome<SettlementRef>> {
@@ -388,33 +473,216 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
     );
   }
 
-  /** Poll Horizon until the tx is in a ledger or we time out. Returns the ledger and feeCharged. */
+  /** Poll Horizon until the tx is in a ledger or we time out. Returns the ledger, feeCharged, and resultXdr. */
   private async confirm(
     hash: string,
-  ): Promise<Outcome<{ ledger?: number; feeCharged?: string }>> {
-    const deadline = this.now() + this.confirmTimeoutMs;
-    for (;;) {
-      try {
-        const tx = await this.server.transactions().transaction(hash).call();
-        if (tx.successful) {
-          return ok({
-            ledger: tx.ledger_attr ?? tx.ledger,
-            feeCharged: tx.fee_charged != null ? tx.fee_charged.toString() : undefined,
-          });
-        }
-        return fail("SETTLEMENT_FAILED", `tx ${hash} failed on-chain`);
-      } catch {
-        // not yet visible
+  ): Promise<Outcome<{ ledger?: number; feeCharged?: string; resultXdr?: string }>> {
+    return confirmTransaction(this.server, hash, {
+      now: this.now,
+      sleep: this.sleep,
+      confirmTimeoutMs: this.confirmTimeoutMs,
+    });
+  }
+}
+
+export interface StellarClaimableBalanceStrategyOptions extends StellarSubmitterOptions {
+  /** Default relative expiry in seconds for claimants if not specified in the request. */
+  predicateSeconds?: number;
+}
+
+export interface ClaimableBalanceSettlementRequest extends SettlementRequest {
+  readonly claimant?: string;
+  readonly predicateSeconds?: number;
+  readonly predicate?: xdr.ClaimPredicate;
+}
+
+/**
+ * Settlement strategy that satisfies `kind: "claimable_balance"`.
+ * Builds and submits `Operation.createClaimableBalance` to fund an anchor
+ * via a claimable balance on Stellar.
+ */
+export class StellarClaimableBalanceStrategy implements SettlementStrategy {
+  /** The fee actually paid per settlement transaction, in XLM decimal string (e.g. "0.00001"). */
+  static readonly fee: string = fromScaled(BigInt(BASE_FEE), STROOP_SCALE);
+
+  readonly fee: string;
+  readonly kind: DepositInstructionsKind = "claimable_balance";
+  private readonly signer: ExternalSigner;
+  private readonly server: HorizonServerLike;
+  private readonly inspector: AccountInspector;
+  private readonly confirmTimeoutMs: number;
+  private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly defaultPredicateSeconds?: number;
+  private readonly lock = new AsyncLock();
+
+  constructor(opts: StellarClaimableBalanceStrategyOptions) {
+    if (!opts.signer && !opts.signerSecret) {
+      throw new Error(
+        "StellarClaimableBalanceStrategy: provide either `signer` or `signerSecret`",
+      );
+    }
+    this.signer = opts.signer ?? LocalKeypairSigner.fromSecret(opts.signerSecret as string);
+    this.server = opts.horizonServer ?? new Horizon.Server(opts.horizonUrl);
+    this.inspector =
+      opts.inspector ??
+      new AccountInspector({
+        horizonServer: this.server,
+        horizonUrl: opts.horizonUrl,
+      });
+    this.confirmTimeoutMs = opts.confirmTimeoutMs ?? 30_000;
+    this.now = opts.now ?? (() => Date.now());
+    this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    const fee = opts.fee ?? StellarClaimableBalanceStrategy.fee;
+    if (!toScaled(fee, STROOP_SCALE).ok) {
+      throw new Error(
+        `StellarClaimableBalanceStrategy: invalid \`fee\` "${fee}" (expected an XLM decimal string)`,
+      );
+    }
+    this.fee = fee;
+    this.defaultPredicateSeconds = opts.predicateSeconds;
+  }
+
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.lock.withLock(fn);
+  }
+
+  private async confirm(
+    hash: string,
+  ): Promise<Outcome<{ ledger?: number; feeCharged?: string; resultXdr?: string }>> {
+    return confirmTransaction(this.server, hash, {
+      now: this.now,
+      sleep: this.sleep,
+      confirmTimeoutMs: this.confirmTimeoutMs,
+    });
+  }
+
+  async settle({
+    opened,
+    quote,
+    corridor,
+  }: SettlementStrategyContext): Promise<Outcome<SettlementRef>> {
+    const rawOpened = opened as unknown as Record<string, unknown>;
+    const instructions = (rawOpened.instructions as Record<string, unknown> | undefined) ?? {};
+    const claimant =
+      (instructions.claimant as string | undefined) ??
+      (rawOpened.claimant as string | undefined) ??
+      opened.depositAddress;
+    const predicateSeconds =
+      (instructions.predicateSeconds as number | undefined) ??
+      (rawOpened.predicateSeconds as number | undefined);
+
+    const baseReq = buildSettlementRequest(opened, quote, corridor);
+    return this.submit({
+      ...baseReq,
+      claimant,
+      predicateSeconds,
+    });
+  }
+
+  async submit(req: ClaimableBalanceSettlementRequest): Promise<Outcome<SettlementRef>> {
+    const now = this.now();
+    if (req.validUntil !== undefined && req.validUntil <= now) {
+      return fail("QUOTE_EXPIRED", `quote expired at ${req.validUntil} (now=${now})`, {
+        retryable: false,
+      });
+    }
+
+    const claimant = req.claimant ?? req.to;
+    if (!claimant) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        "claimable balance settlement requires a claimant address",
+        {
+          retryable: false,
+        },
+      );
+    }
+
+    let hash: string | undefined;
+    let calculatedBalanceId: string | undefined;
+    let submitAttempted = false;
+    try {
+      const { network } = req.corridor.settlement;
+      const passphrase = passphraseFor(network);
+      const asset = bridgeAsset(req.amount.asset, req.corridor.settlement.asset_issuer);
+
+      await this.withLock(async () => {
+        const source = await this.server.loadAccount(this.signer.publicKey);
+        const feeScaled = toScaled(this.fee, STROOP_SCALE);
+        const feeStroops = feeScaled.ok ? feeScaled.value.toString() : BASE_FEE;
+        const nowSec = Math.floor(this.now() / 1000);
+        const ttlMaxTime = nowSec + req.corridor.fx.quote_ttl_seconds;
+        const maxTime =
+          req.validUntil !== undefined
+            ? Math.min(Math.floor(req.validUntil / 1000), ttlMaxTime)
+            : ttlMaxTime;
+
+        const predicateSeconds = req.predicateSeconds ?? this.defaultPredicateSeconds;
+        const predicate =
+          req.predicate ??
+          (predicateSeconds !== undefined
+            ? Claimant.predicateBeforeRelativeTime(predicateSeconds.toString())
+            : Claimant.predicateUnconditional());
+
+        const builder = new TransactionBuilder(source, {
+          fee: feeStroops,
+          networkPassphrase: passphrase,
+        })
+          .addOperation(
+            Operation.createClaimableBalance({
+              asset,
+              amount: req.amount.amount,
+              claimants: [new Claimant(claimant, predicate)],
+            }),
+          )
+          .setTimebounds(0, maxTime);
+
+        if (req.memo) builder.addMemo(buildMemo(req.memo, req.memoType));
+
+        const tx = builder.build();
+        hash = Buffer.from(tx.hash()).toString("hex");
+        calculatedBalanceId = calculateClaimableBalanceId(source.accountId(), tx.sequence, 0);
+        await attachSignature(tx, this.signer);
+
+        submitAttempted = true;
+        await this.server.submitTransaction(tx);
+      });
+
+      const confirmed = await this.confirm(hash as string);
+      if (!confirmed.ok) return confirmed;
+      const claimableBalanceId =
+        extractClaimableBalanceId(confirmed.value.resultXdr) ?? calculatedBalanceId;
+      return ok<SettlementRef>({
+        stellarTxHash: hash as string,
+        ledger: confirmed.value.ledger,
+        feeCharged: confirmed.value.feeCharged,
+        claimableBalanceId,
+      });
+    } catch (cause) {
+      if (!submitAttempted || cause instanceof TransactionFailedError) {
+        return fail("SETTLEMENT_FAILED", `settlement submit failed: ${describe(cause)}`, {
+          retryable: true,
+          cause,
+        });
       }
-      if (this.now() >= deadline) {
-        // NOT retryable-by-resubmission: the transaction may still land (or,
-        // on the happy path, may have already landed and Horizon's read side
-        // is just lagging), and sending a second one would risk a double
-        // payment. Timeout means "needs manual reconciliation," not "safe to
-        // retry" — mirrors packages/attester/src/index.ts's confirm().
-        return fail("SETTLEMENT_TIMEOUT", `tx ${hash} not confirmed within timeout`);
+      const landed = await this.confirm(hash as string);
+      if (landed.ok) {
+        const claimableBalanceId =
+          extractClaimableBalanceId(landed.value.resultXdr) ?? calculatedBalanceId;
+        return ok<SettlementRef>({
+          stellarTxHash: hash as string,
+          ledger: landed.value.ledger,
+          feeCharged: landed.value.feeCharged,
+          claimableBalanceId,
+        });
       }
-      await this.sleep(1_000);
+      return fail(
+        landed.error.code,
+        `settlement submit ambiguous for tx ${hash} (${describe(cause)}); ` +
+          `confirm check: ${landed.error.message}`,
+        { retryable: landed.error.retryable, cause },
+      );
     }
   }
 }

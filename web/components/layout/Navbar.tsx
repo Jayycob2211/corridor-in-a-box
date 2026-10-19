@@ -18,7 +18,7 @@ export function Navbar() {
           <span>corridor-in-a-box</span>
         </Link>
 
-        <nav className="flex items-center gap-1">
+        <nav aria-label="Main" className="flex items-center gap-1">
           {links.map((l) => (
             <Link
               key={l.href}
@@ -32,7 +32,7 @@ export function Navbar() {
             href="https://github.com"
             target="_blank"
             rel="noreferrer"
-            aria-label="GitHub"
+            aria-label="GitHub (opens in a new tab)"
             className="rounded-lg p-2 text-secondary-text transition-colors hover:bg-bg-subtle"
           >
             <GithubIcon size={18} />

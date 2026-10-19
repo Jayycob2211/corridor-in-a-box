@@ -5,7 +5,7 @@
 //
 //   corridor validate <file.corridor.yaml>
 //   corridor plan     <file.corridor.yaml>
-//   corridor canary   <file.corridor.yaml> --amount <amount> [--network <public|testnet>]
+//   corridor canary   <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--dry-run]
 //   corridor breaker  status [corridorId]
 //   corridor breaker  reset <corridorId> --reason "…"
 //
@@ -15,6 +15,7 @@
 //
 // `canary` drives one tiny real payment through the full, gated stack:
 // Sep31Adapter + StellarSettlementSubmitter + the default gate + RegistryRouteResolver.
+// With --dry-run it stops after the pre-settle gate and never submits a payment.
 //
 // `breaker` is the other end: when a lane has halted itself, someone has to look
 // at why and then say so in writing before it will take money again. See
@@ -81,6 +82,7 @@ async function main(argv: string[]): Promise<number> {
     let network: string | undefined;
     let skipDoctor = false;
     let write = false;
+    let dryRun = false;
 
     const rest = argv.slice(1);
     for (let i = 0; i < rest.length; i++) {
@@ -105,6 +107,8 @@ async function main(argv: string[]): Promise<number> {
         skipDoctor = true;
       } else if (arg === "--write") {
         write = true;
+      } else if (arg === "--dry-run") {
+        dryRun = true;
       } else if (arg.startsWith("--")) {
         console.error(`error: unknown option "${arg}"`);
         return 2;
@@ -120,8 +124,13 @@ async function main(argv: string[]): Promise<number> {
 
     if (!file) {
       console.error(
-        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--write]",
+        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--write | --dry-run]",
       );
+      return 2;
+    }
+
+    if (dryRun && write) {
+      console.error("error: --write records a completed payment; a --dry-run makes none");
       return 2;
     }
 
@@ -150,6 +159,7 @@ async function main(argv: string[]): Promise<number> {
       amount,
       network,
       skipDoctor,
+      dryRun,
     });
     if (runResult.exitCode !== 0 || !runResult.run || !runResult.settlement) {
       return runResult.exitCode;

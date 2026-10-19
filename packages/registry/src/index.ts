@@ -28,9 +28,14 @@ export const PROBE_NAMES = [
   "sep38_quote",
   "sep12_status",
   "sep31_info",
+  "sep6_info",
+  "sep6_auth",
 ] as const;
 
 export type ProbeName = (typeof PROBE_NAMES)[number];
+
+/** Protocols the registry can answer a "does this anchor serve it" query for. */
+export type Protocol = "sep31" | "sep6";
 
 export interface AnchorAttestation {
   readonly domain: string;
@@ -217,31 +222,66 @@ export class AnchorRegistry {
     return this.read<boolean>("serves_sep31", nativeToScValString(domain));
   }
 
+  /**
+   * Whether the anchor both ADVERTISES SEP-6 and PASSED the sep6_info probe.
+   * The contract keys the SEP-6 answer off sep6_info, the same way the SEP-31
+   * answer keys off sep31_info.
+   */
+  async servesSep6(domain: string): Promise<boolean> {
+    return this.read<boolean>("serves_sep6", nativeToScValString(domain));
+  }
+
+  /**
+   * Protocol-agnostic form of the two queries above, for callers that only know
+   * the protocol at runtime. It dispatches to the matching contract method
+   * rather than computing a bit locally, so the definition of "serves" stays in
+   * one place: the contract.
+   */
+  async serves(domain: string, protocol: Protocol): Promise<boolean> {
+    switch (protocol) {
+      case "sep31":
+        return this.servesSep31(domain);
+      case "sep6":
+        return this.servesSep6(domain);
+    }
+  }
+
   /** How many ledgers old the attestation is. */
   async staleness(domain: string): Promise<number> {
     return this.read<number>("staleness", nativeToScValString(domain));
   }
 
   /**
-   * Domains that are attested as genuinely serving SEP-31 receive-side AND whose
-   * attestation is fresher than `maxStalenessLedgers` (default ~1 week at 5s
-   * ledgers). The query an operator looking for an off-ramp actually has.
+   * Domains that are attested as genuinely serving `protocol` receive-side AND
+   * whose attestation is fresher than `maxStalenessLedgers` (default ~1 week at
+   * 5s ledgers). The query an operator looking for a rail actually has.
    *
    * Freshness is not optional here: an attestation from six months ago is not
    * evidence about today, and letting callers forget to check would rebuild the
    * problem this registry exists to solve.
    */
-  async liveSep31Anchors(maxStalenessLedgers = 120_960): Promise<string[]> {
+  async liveAnchors(
+    protocol: Protocol,
+    maxStalenessLedgers = WEEK_OF_LEDGERS,
+  ): Promise<string[]> {
     const all = await this.domains();
     const out: string[] = [];
     for (const domain of all) {
       const [serves, age] = await Promise.all([
-        this.servesSep31(domain),
+        this.serves(domain, protocol),
         this.staleness(domain),
       ]);
       if (serves && age <= maxStalenessLedgers) out.push(domain);
     }
     return out;
+  }
+
+  /**
+   * SEP-31 convenience wrapper over `liveAnchors`. Most callers mean the
+   * receive-side SEP-31 off-ramp, so the named form is kept.
+   */
+  async liveSep31Anchors(maxStalenessLedgers = WEEK_OF_LEDGERS): Promise<string[]> {
+    return this.liveAnchors("sep31", maxStalenessLedgers);
   }
 
   /**
@@ -373,6 +413,56 @@ export function decodeAttestationEvent(event: {
     attestedLedger: attestedLedgerNum,
     attester: "",
   };
+}
+
+/** Approximate ledgers in one week at 5 seconds per ledger. (7 * 24 * 60 * 60 / 5) */
+export const WEEK_OF_LEDGERS = 120_960;
+
+/** Default maximum staleness threshold for scheduled runs: ~2 days at 5s per ledger. (2 * 24 * 60 * 60 / 5) */
+export const MAX_STALENESS_LEDGERS = 34_560;
+
+export interface StalenessRecord {
+  readonly domain: string;
+  readonly ledgersOld?: number | null;
+  readonly staleness?: number | null;
+  readonly neverAttested?: boolean;
+}
+
+export interface StaleDomain {
+  readonly domain: string;
+  readonly reason: "stale" | "never-attested";
+  readonly ledgersOld?: number | null;
+  readonly threshold: number;
+}
+
+/**
+ * Filter records for any domain that is stale or was never attested.
+ * Returns records where the domain was never attested or exceeds the staleness threshold.
+ */
+export function findStale(
+  records: readonly StalenessRecord[],
+  threshold: number = MAX_STALENESS_LEDGERS,
+): StaleDomain[] {
+  const stale: StaleDomain[] = [];
+  for (const record of records) {
+    const age = record.ledgersOld ?? record.staleness;
+    if (record.neverAttested || age === null || age === undefined) {
+      stale.push({
+        domain: record.domain,
+        reason: "never-attested",
+        ledgersOld: null,
+        threshold,
+      });
+    } else if (typeof age === "number" && age > threshold) {
+      stale.push({
+        domain: record.domain,
+        reason: "stale",
+        ledgersOld: age,
+        threshold,
+      });
+    }
+  }
+  return stale;
 }
 
 // The SDK's nativeToScVal infers `String` for JS strings only with an explicit

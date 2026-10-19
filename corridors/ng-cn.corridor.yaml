@@ -1,3 +1,49 @@
+# ─── RMB off-ramp research (#230), checked 2026-10-18 ──────────────────────────
+# Question: who could pay out CNY on Stellar today, and through which SEP?
+# Answer: nobody found. No anchor in the Stellar Anchor Directory lists a CNY,
+# CNH, RMB or HKD fiat asset, and none of the candidates below advertises SEP-31.
+#
+# Method: read every directory entry (https://anchors.stellar.org; the page's
+# embedded data, all 74 entries) for China, Hong Kong or Singapore coverage or a
+# CNY/CNH/HKD/SGD fiat asset, then ran `pnpm probe:anchor <domain>` against each
+# one that names a stellar.toml or claims a SEP. Every probed domain is now in
+# contracts/anchors.json, so the scheduled attester keeps these results current.
+#
+# Probed (directory listing -> probe result):
+#   MoneyGram Ramps  stellar.moneygram.com      HK, SG; SEP-24   toml OK: SEP-10 and
+#                                                                SEP-24 only, USDC
+#                                                                cash-out, no SEP-31;
+#                                                                SEP-10 probe failed
+#                                                                (fetch failed)
+#   Mercuryo         mercuryo.io               CN, SG; SEP-6,24,31 no toml (timeout)
+#   Lightnet         lightnet.io               CN, SG; SEP-24   no toml (HTTP 404)
+#   OwlPay           owlting.com               CN, HK, SG; SEP-24 no toml (timeout)
+#   Arf              arf.one                   CN, SG           no toml (HTTP 404)
+#   Banxa            stellar-sep-24.banxa.com  HK               no toml (HTTP 403)
+# Listed for CN/HK/SG but not probed, because the entry names no toml and no SEP
+# (exchanges, not anchors a corridor can call): Binance, Bitstamp, Bybit, CEX.io,
+# Crypto.com, Huobi, Kraken, KuCoin, OkCoin, Bitnovo. The only directory entry
+# with an SGD fiat asset is Coinbase (exchange; no toml, no SEP listed).
+#
+# Constraints that keep this lane pending:
+#   - Mainland China: the PBOC and nine other agencies' notice of 15 Sep 2021 made
+#     exchanging fiat and virtual currency, and offshore platforms serving
+#     mainland residents, illegal financial activity, and barred banks and payment
+#     firms from supporting it. A compliant CNY payout leg does not exist under it.
+#     https://cms.law/en/chn/legal-updates/china-imposes-strict-bans-on-virtual-currencies
+#   - Hong Kong: the Stablecoins Ordinance (Cap. 656) took effect 1 Aug 2025 and
+#     requires an HKMA licence to issue an HKD-pegged stablecoin. An HKD or CNH leg
+#     through a licensed HK entity is the realistic route, but no such anchor is
+#     on Stellar yet.
+#     https://www.morganlewis.com/pubs/2025/06/hong-kongs-stablecoins-ordinance-to-take-effect-august-1-an-overview-of-the-regulatory-framework
+#
+# Source side: cowrie.exchange (corridors/ng-cowrie.corridor.yaml) is a real
+# Nigerian anchor whose SEP-10 and SEP-31 probes pass. It is proposed as the real
+# value for source.endpoints.home_domain below, for source-side verification only;
+# it is left as the placeholder here until a maintainer confirms the role fits.
+#
+# Do not fill dest.endpoints until a candidate's SEP-31 receive probe passes.
+
 # Nigeria -> China. The headline case study, NOT corridor #1.
 # This manifest is the whole thesis in one file: the day a compliant RMB SEP-31
 # receiving anchor exists, you fill in dest.endpoints and this becomes runnable on
@@ -7,7 +53,7 @@
 # but `corridor plan` will flag it as NOT runnable because the dest SEP-31 server
 # is absent — which is exactly the off-ramp scarcity, surfaced by tooling.
 id: ng-cn
-status_note: "PENDING — no compliant RMB SEP-31 off-ramp exists yet. dest endpoints unfilled."
+status_note: "PENDING — no compliant RMB SEP-31 off-ramp exists yet (checked 2026-10-18: no directory anchor offers CNY/CNH/HKD payout or SEP-31 for CN/HK). dest endpoints unfilled."
 
 source:
   name: Nigeria On-Ramp (e.g. cNGN/Cowrie-class)
