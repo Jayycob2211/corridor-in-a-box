@@ -30,12 +30,9 @@ export type CorridorErrorCode =
   | "ANCHOR_UNAVAILABLE"
   | "SETTLEMENT_FAILED"
   | "SETTLEMENT_TIMEOUT"
-  | "REFUND_UNSUPPORTED"
   | "RECONCILE_MISMATCH"
   | "RECONCILE_STALLED"
   | "IDEMPOTENCY_CONFLICT"
-  /** live /info or stellar.toml no longer matches what was verified */
-  | "PRESETTLE_ANCHOR_DRIFT"
   /** the opened anchor transaction is not what we are about to pay */
   | "PRESETTLE_TX_MISMATCH"
   /** destination missing, no trustline, or not authorized */
@@ -63,7 +60,13 @@ export type CorridorErrorCode =
    * settle payment. The run is persisted as `failed` so its key cannot later
    * be reused to move money.
    */
-  | "DRY_RUN_COMPLETE";
+  | "DRY_RUN_COMPLETE"
+  /**
+   * The route resolver refused to route this payment (for example an
+   * unattested anchor). Fail-closed by design: the refusal is recorded as a
+   * `failed` run with an audit entry and is not retryable with the same key.
+   */
+  | "ROUTE_REFUSED";
 
 /**
  * Returns true if the error code is a pre-settle gate check refusal.
