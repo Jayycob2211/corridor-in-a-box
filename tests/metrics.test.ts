@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+// @ts-expect-error This JavaScript parser package does not publish TypeScript declarations.
+import parsePrometheusTextFormat from "parse-prometheus-text-format";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
@@ -137,37 +139,95 @@ describe("metrics", () => {
 });
 
 describe("PrometheusMetrics", () => {
-  it("renders counters and timings in exposition format, with sanitized names", async () => {
+  it("emits parser-readable counter and histogram families with HELP metadata", async () => {
     const m = new PrometheusMetrics();
+    m.registerHelp("corridor.terminal", "Number of payments reaching a terminal state.");
     const r = await execute(intent, corridor(), deps(m as unknown as InMemoryMetrics));
     expect(r.ok).toBe(true);
-    const text = m.render();
+    const parsed = parsePrometheusTextFormat(m.render()) as {
+      name: string;
+      type: string;
+      help: string;
+      metrics: Array<{
+        value?: string;
+        count?: string;
+        sum?: string;
+        buckets?: Record<string, string>;
+        labels?: Record<string, string>;
+      }>;
+    }[];
+    const counter = parsed.find((family) => family.name === "corridor_terminal");
+    expect(counter).toMatchObject({
+      type: "COUNTER",
+      help: "Number of payments reaching a terminal state.",
+    });
+    expect(counter?.metrics.some((sample) => sample.labels?.state === "completed")).toBe(true);
 
-    // Dots become underscores; tags become labels.
-    expect(text).toContain("# TYPE corridor_transition counter");
-    expect(text).toMatch(/corridor_transition\{[^}]*to="completed"[^}]*\} 1/);
-    expect(text).toContain('corridor_terminal{corridor="test",state="completed"} 1');
-    // Timings render as a summary (_count + _sum).
-    expect(text).toContain("# TYPE corridor_verb_quote_ms summary");
-    expect(text).toMatch(/corridor_verb_quote_ms_count\{corridor="test"\} 1/);
+    const histogram = parsed.find((family) => family.name === "corridor_verb_quote_seconds");
+    expect(histogram).toMatchObject({
+      type: "HISTOGRAM",
+      help: "Duration of corridor_verb_quote operations in seconds.",
+    });
+    // The parser only surfaces _count/_sum for unlabelled series, so check the
+    // labelled ones in the raw exposition.
+    const text = m.render();
+    expect(text).toMatch(/^corridor_verb_quote_seconds_count\{[^}]*\} 1$/m);
+    expect(text).toMatch(/^corridor_verb_quote_seconds_sum\{[^}]*\} \S+$/m);
+    expect(histogram?.metrics[0].buckets?.["+Inf"]).toBe("1");
   });
 
-  it("aggregates repeated samples into one series", () => {
-    const m = new PrometheusMetrics();
+  it("aggregates repeated timing samples and emits cumulative buckets in seconds", () => {
+    const m = new PrometheusMetrics({ buckets: [0.01, 0.025, 0.05] });
     m.increment("corridor.transition", { to: "settled" });
     m.increment("corridor.transition", { to: "settled" });
-    m.timing("corridor.verb.settle", 10, { corridor: "x" });
-    m.timing("corridor.verb.settle", 30, { corridor: "x" });
-    const text = m.render();
-    expect(text).toContain('corridor_transition{to="settled"} 2');
-    expect(text).toContain('corridor_verb_settle_ms_count{corridor="x"} 2');
-    expect(text).toContain('corridor_verb_settle_ms_sum{corridor="x"} 40');
+    m.timing("corridor.verb.settle", 10);
+    m.timing("corridor.verb.settle", 30);
+    const parsed = parsePrometheusTextFormat(m.render()) as {
+      name: string;
+      type: string;
+      metrics: Array<{
+        value?: string;
+        count?: string;
+        sum?: string;
+        buckets?: Record<string, string>;
+      }>;
+    }[];
+    expect(
+      parsed.find((family) => family.name === "corridor_transition")?.metrics[0].value,
+    ).toBe("2");
+    const histogram = parsed.find((family) => family.name === "corridor_verb_settle_seconds");
+    expect(histogram?.metrics[0]).toMatchObject({
+      count: "2",
+      sum: "0.04",
+      buckets: { "0.01": "1", "0.025": "1", "0.05": "2", "+Inf": "2" },
+    });
+    const counts = Object.entries(histogram?.metrics[0].buckets ?? {})
+      .filter(([bound]) => bound !== "+Inf")
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([, count]) => Number(count));
+    expect(counts.every((count, index) => index === 0 || count >= counts[index - 1])).toBe(
+      true,
+    );
   });
 
-  it("escapes label values", () => {
+  it("escapes quotes, backslashes and newlines in label values for a real parser", () => {
     const m = new PrometheusMetrics();
-    m.increment("e", { msg: 'a"b\\c' });
-    expect(m.render()).toContain('e{msg="a\\"b\\\\c"} 1');
+    const labelValue = 'a"b\\c\nx';
+    m.increment("e", { msg: labelValue });
+    const parsed = parsePrometheusTextFormat(m.render()) as {
+      name: string;
+      metrics: Array<{ labels?: Record<string, string> }>;
+    }[];
+    expect(parsed.find((family) => family.name === "e")?.metrics[0].labels?.msg).toBe(
+      labelValue,
+    );
+  });
+
+  it("rejects invalid histogram bucket configurations", () => {
+    expect(() => new PrometheusMetrics({ buckets: [0.1, 0.1] })).toThrow(
+      /strictly increasing/,
+    );
+    expect(() => new PrometheusMetrics({ buckets: [0, 1] })).toThrow(/strictly increasing/);
   });
 });
 

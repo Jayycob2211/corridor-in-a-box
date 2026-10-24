@@ -7,11 +7,15 @@ import {
   InMemoryAlerting,
   InMemoryIdempotencyStore,
   InMemoryMetrics,
+  childLogger,
   createMockSubmitter,
   execute,
   reconcileUntil,
+  scopedAuditSink,
   type CheckResult,
   type EngineDeps,
+  type Logger,
+  type LogFields,
   type PreSettleGate,
 } from "@corridor/engine";
 import type { PaymentIntent } from "@corridor/types";
@@ -468,5 +472,149 @@ describe("pre-settle gate results in the audit trail", () => {
     expect(r.ok).toBe(true);
     const withChecks = audit.entries.filter((e) => "checks" in e).map((e) => e.to);
     expect(withChecks).toEqual(["verifying"]);
+  });
+});
+
+// --- request scoping -------------------------------------------------------
+// The id exists so a caller's 500 can be traced into the trail. That only works
+// if NOTHING escapes it: the scope is applied to the sinks once, at the top of
+// execute(), so a line or an entry cannot be added later without it.
+describe("request scope in logs and audit", () => {
+  const capture = () => {
+    const lines: { level: string; msg: string; fields?: LogFields }[] = [];
+    const logger: Logger = {
+      log: (level, msg, fields) => {
+        lines.push({ level, msg, fields });
+      },
+    };
+    return { lines, logger };
+  };
+
+  const depsWith = (over: Partial<EngineDeps>): EngineDeps => ({
+    resolver: new StaticRouteResolver(() => createMockAdapter(), {
+      trustManifestWithoutAttestation: true,
+    }),
+    submitter: createMockSubmitter(),
+    idempotency: new InMemoryIdempotencyStore(),
+    trustManifestWithoutAttestation: true,
+    unsafeSkipPreSettleGate: true,
+    ...over,
+  });
+
+  it("stamps requestId on every transition entry, detail and log line of a run", async () => {
+    const audit = new InMemoryAuditLog();
+    const { lines, logger } = capture();
+    const r = await execute(
+      { ...intent, idempotencyKey: "obs-rid" },
+      corridor(),
+      depsWith({ audit, logger }),
+      {
+        requestId: "req-42",
+        traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+      },
+    );
+    expect(r.ok).toBe(true);
+
+    expect(audit.entries.length).toBeGreaterThan(0);
+    for (const e of audit.entries) expect(e.requestId).toBe("req-42");
+    for (const d of audit.details) expect(d.requestId).toBe("req-42");
+    expect(lines.length).toBeGreaterThan(0);
+    for (const l of lines) expect(l.fields?.requestId).toBe("req-42");
+    // traceparent rides along on the same lines, without replacing the id.
+    for (const l of lines) {
+      expect(l.fields?.traceparent).toBe(
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+      );
+    }
+  });
+
+  it("stamps requestId on the audit detail written before the idempotency claim", async () => {
+    // `corridor.verifying` is emitted ahead of the run row existing, so it is the
+    // one line a per-entry stamp at the transition site would have missed.
+    const audit = new InMemoryAuditLog();
+    const { lines, logger } = capture();
+    await execute(
+      { ...intent, idempotencyKey: "obs-rid-verify" },
+      corridor(),
+      depsWith({ audit, logger }),
+      { requestId: "req-43" },
+    );
+    const verifying = lines.find((l) => l.msg === "corridor.verifying");
+    expect(verifying?.fields?.requestId).toBe("req-43");
+    expect(audit.details[0]?.requestId).toBe("req-43");
+  });
+
+  it("leaves the fields off entirely when the caller named no request", async () => {
+    const audit = new InMemoryAuditLog();
+    const { lines, logger } = capture();
+    const r = await execute(
+      { ...intent, idempotencyKey: "obs-norid" },
+      corridor(),
+      depsWith({ audit, logger }),
+    );
+    expect(r.ok).toBe(true);
+    for (const e of audit.entries) expect(e).not.toHaveProperty("requestId");
+    for (const l of lines) expect(l.fields).not.toHaveProperty("requestId");
+  });
+
+  it("childLogger folds the scope under each line's own fields", () => {
+    const seen: LogFields[] = [];
+    const base: Logger = { log: (_l, _m, fields) => seen.push(fields ?? {}) };
+    childLogger(base, { requestId: "a", corridorId: "scope" }).log("info", "x", {
+      requestId: "b",
+    });
+    expect(seen).toEqual([{ requestId: "b", corridorId: "scope" }]);
+  });
+
+  it("childLogger uses the sink's own child() when it has one", () => {
+    const scoped: LogFields[] = [];
+    const sink: Logger = {
+      log: (_l, _m, fields) => scoped.push(fields ?? {}),
+      child: (fields) => ({
+        log: (_l2, _m2, line) => scoped.push({ child: true, ...fields, ...line }),
+      }),
+    };
+    childLogger(sink, { requestId: "r" }).log("info", "x");
+    expect(scoped).toEqual([{ child: true, requestId: "r" }]);
+  });
+
+  it("scopedAuditSink stamps entries and details, and the caller's field wins", () => {
+    const recorded: unknown[] = [];
+    const sink = scopedAuditSink(
+      {
+        record: (e) => {
+          recorded.push(e);
+        },
+        recordDetail: (d) => {
+          recorded.push(d);
+        },
+      },
+      {
+        requestId: "req-9",
+        traceparent: "00-aaaabbbbccccddddeeeeffff00001111-0123456789abcdef-01",
+      },
+    );
+    sink.record({
+      idempotencyKey: "k",
+      corridorId: "c",
+      from: "created",
+      to: "quoted",
+      version: 1,
+      at: 0,
+      requestId: "mine",
+    });
+    sink.recordDetail!({
+      event: "verifying",
+      idempotencyKey: "k",
+      corridorId: "c",
+      at: 0,
+      detail: { liveness: "unverified" },
+    });
+    expect(recorded[0]).toMatchObject({ requestId: "mine" });
+    expect(recorded[1]).toMatchObject({
+      event: "verifying",
+      requestId: "req-9",
+      traceparent: "00-aaaabbbbccccddddeeeeffff00001111-0123456789abcdef-01",
+    });
   });
 });

@@ -1,0 +1,53 @@
+# Dev container stack.
+#
+# `app` is the development environment (see devcontainer.json); `db` is the
+# Postgres the opt-in suites need — tests/integration/idempotency-pg.test.ts and
+# the Postgres variant of tests/integration/crash-resume.test.ts. Both come up
+# with the container and CORRIDOR_TEST_DATABASE_URL is already set, so the
+# "start a database yourself" step the CONTRIBUTING instructions describe is
+# done; the crash-resume cases still need a live anchor, exactly as on a bare
+# machine.
+#
+# Credentials and database name mirror the `postgres:` service container in
+# .github/workflows/ci.yml (POSTGRES_PASSWORD=pg, POSTGRES_DB=corridor_test);
+# only the host differs, because `app` reaches it over the compose network.
+
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/typescript-node:22-bookworm
+    # Nothing runs as PID 1 here; this keeps the container alive so the
+    # devcontainer CLI and the editor can exec into it.
+    command: sleep infinity
+    volumes:
+      # The repository is mounted, not copied, so edits stay the host's files.
+      # devcontainer.json declares /workspaces as the workspace folder.
+      - ..:/workspaces:cached
+    environment:
+      CORRIDOR_TEST_DATABASE_URL: postgres://postgres:pg@db:5432/corridor_test
+    depends_on:
+      db:
+        # `pnpm test` now exercises the Postgres suite too, so it must not run
+        # against a server that is still initialising.
+        condition: service_healthy
+
+  db:
+    image: docker.io/library/postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: pg
+      POSTGRES_DB: corridor_test
+    volumes:
+      # Kept across container rebuilds: re-running migrate() is cheap, but
+      # initdb on every start is not.
+      - corridor-test-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d corridor_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Deliberately not published on the host: every test that needs it runs
+    # inside `app` against db:5432. Publishing 5432 would also collide with the
+    # throwaway server `just pg-test` starts on that port.
+
+volumes:
+  corridor-test-pgdata:

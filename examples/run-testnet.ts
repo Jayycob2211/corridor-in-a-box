@@ -104,7 +104,14 @@ async function main(): Promise<void> {
   // Only "sep31" is registered, so any other protocol throws here with a clear error;
   // what comes back is a Sep31Adapter, which the SEP-12 registration below needs.
   const adapter = registry.adapterFor(corridor) as Sep31Adapter;
-  const submitter = new StellarSettlementSubmitter({ signer, horizonUrl });
+  // The exit(3) above only stops the _example_ from starting; the submitter now
+  // refuses mainnet at signing time too, so the same opt-in governs both.
+  const submitter = new StellarSettlementSubmitter({
+    signer,
+    horizonUrl,
+    allowedNetworks:
+      process.env.CORRIDOR_ALLOW_MAINNET === "1" ? ["testnet", "public"] : ["testnet"],
+  });
   const { store, close } = await buildStore();
   const audit = new InMemoryAuditLog();
 

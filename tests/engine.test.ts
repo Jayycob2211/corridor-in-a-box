@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseCorridor, hashCorridor, type Corridor } from "@corridor/manifest";
-import { createMockAdapter, type OpenTransaction } from "@corridor/adapter-kit";
+import {
+  createMockAdapter,
+  createMockSourceAdapter,
+  type OpenTransaction,
+} from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
 import { amountRangeCheck } from "@corridor/sep31";
 import {
@@ -25,10 +29,18 @@ import {
 import type { TransactionStatus } from "@corridor/adapter-kit";
 import { fail, ok, type Outcome, type PaymentIntent, settlementId } from "@corridor/types";
 
-function corridor(): Corridor {
+function corridor(sourceProtocol: "prefunded" | "sep6" = "prefunded"): Corridor {
   const r = parseCorridor({
     id: "test",
-    source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
+    source: {
+      name: "S",
+      asset: "USDC",
+      protocol: sourceProtocol,
+      endpoints: {
+        home_domain: "s.example",
+        ...(sourceProtocol === "sep6" && { transfer_server: "https://s.example/sep6" }),
+      },
+    },
     dest: {
       name: "D",
       asset: "iso4217:ARS",
@@ -77,6 +89,28 @@ function deps(adapterOpts = {}, trustManifestWithoutAttestation = true): EngineD
 }
 
 describe("engine.execute", () => {
+  it("funds a non-prefunded corridor through its source adapter before settling", async () => {
+    const nonPrefunded = corridor("sep6");
+    const source = createMockSourceAdapter();
+    const receiving = createMockAdapter();
+    const r = await execute(intent("source-funded"), nonPrefunded, {
+      ...deps(),
+      resolver: {
+        async resolve() {
+          return { receiving, sending: source, trust: "manifest" as const };
+        },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.state).toBe("completed");
+      expect(r.value.trail).toContain("funding");
+      expect(r.value.trail).toContain("funded");
+      expect(r.value.trail.indexOf("funding")).toBeLessThan(r.value.trail.indexOf("settling"));
+      expect(r.value.trail.indexOf("funded")).toBeLessThan(r.value.trail.indexOf("settling"));
+    }
+  });
+
   it("walks a payment to completed", async () => {
     const r = await execute(intent(), corridor(), deps());
     expect(r.ok).toBe(true);
@@ -567,6 +601,61 @@ function resumableRun(state: CorridorState, key = "resume-state"): StoredRun {
 }
 
 describe("engine crash resume states", () => {
+  it("resumes an opened non-prefunded run by funding before settlement", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const key = "resume-opened-source";
+    await store.put(resumableRun("opened", key));
+    const source = createMockSourceAdapter();
+    const openDeposit = vi.spyOn(source, "openDeposit");
+    const receiving = createMockAdapter();
+    const r = await execute(intent(key), corridor("sep6"), {
+      ...deps(),
+      idempotency: store,
+      resolver: {
+        async resolve() {
+          return { receiving, sending: source, trust: "manifest" as const };
+        },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.trail).toContain("funding");
+      expect(r.value.trail).toContain("funded");
+      expect(r.value.trail.indexOf("funded")).toBeLessThan(r.value.trail.indexOf("settling"));
+    }
+    expect(openDeposit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["funding", "funded"] as const)(
+    "resumes from %s without opening a second source deposit",
+    async (state) => {
+      const store = new InMemoryIdempotencyStore();
+      const key = "resume-funded";
+      const c = corridor();
+      const source = createMockSourceAdapter();
+      const deposit = await source.openDeposit(intent(key), c);
+      if (!deposit.ok) throw new Error("mock source deposit did not open");
+      await store.put({
+        ...resumableRun(state, key),
+        sourceTransactionId: deposit.value.transactionId,
+      });
+      const openDeposit = vi.spyOn(source, "openDeposit");
+      const receiving = createMockAdapter();
+      const r = await execute(intent(key), corridor(), {
+        ...deps(),
+        idempotency: store,
+        resolver: {
+          async resolve() {
+            return { receiving, sending: source, trust: "manifest" as const };
+          },
+        },
+      });
+      expect(r.ok).toBe(true);
+      expect(openDeposit).not.toHaveBeenCalled();
+      expect((await store.get(key))?.sourceTransactionId).toBe(deposit.value.transactionId);
+    },
+  );
+
   it.each(["created", "quoted", "compliant"] as const)(
     "%s is failed as stale before anything is sent",
     async (state) => {

@@ -89,8 +89,8 @@ corridors/       the manifests — ALL corridor-specifics live here,
                  nowhere else
 contracts/       Soroban registry + attester contracts
 scripts/         reference-anchor.sh + assert-testnet-corridor.ts
-docs/            key management, bespoke adapters, "why not Anchor Platform",
-                 SEP coverage, operations, …
+docs/            threat model, key management, bespoke adapters,
+                 "why not Anchor Platform", SEP coverage, operations, …
 examples/        runnable end-to-end demo
 ```
 

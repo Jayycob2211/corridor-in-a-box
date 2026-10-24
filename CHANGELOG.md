@@ -7,6 +7,138 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Fixed — Prometheus exposition conformance (#274)
+
+- Added HELP metadata to emitted metric families and changed timing metrics from
+  incomplete millisecond summaries to parser-compatible histograms measured in
+  seconds, with configurable cumulative buckets.
+- **Breaking metrics change:** timing families now use
+  `<name>_seconds_bucket`, `<name>_seconds_sum`, and
+  `<name>_seconds_count` instead of the previous `<name>_ms_count` and
+  `<name>_ms_sum` samples. Update dashboards and alert rules accordingly.
+- Added parser-based regression coverage for family types, HELP text, histogram
+  buckets, aggregation, and escaped labels.
+
+### Added — `PostgresAuditSink`: a durable, append-only audit trail ([#272](https://github.com/ezedike-evan/corridor-in-a-box/issues/272))
+
+The audit trail used to live only in memory, so the service lost it on every
+restart, even when `DATABASE_URL` gave it Postgres.
+
+- `PostgresAuditSink` in `@corridor/engine` writes one `corridor_audit` row per
+  state transition. A unique key on `(idempotency_key, version, to_state)` makes
+  a retried write a no-op. Route trust, fees and gate checks are kept in a
+  `detail` JSON column.
+- `listAudit(idempotencyKey)` returns a payment's trail, oldest first.
+- `migrate()` creates the table. `examples/run-service.ts` uses the sink
+  whenever `DATABASE_URL` is set.
+- `docs/operations.md` documents a service role with `SELECT`/`INSERT` only on
+  the table. It also documents what happens when an audit write fails: the
+  payment stops before its next step and resumes later, and the missed entry
+  shows up as a gap in `version`.
+- The CI `integration-postgres` job now also runs
+  `tests/integration/audit-pg.test.ts`.
+
+### Added — flaky-test quarantine (2026-10-21)
+
+A flaky test can be quarantined instead of deleted or silently skipped
+([#284](https://github.com/ezedike-evan/corridor-in-a-box/issues/284)):
+
+- `quarantine(issueUrl, name, fn)` in `tests/helpers/quarantine.ts` wraps a
+  sequential describe block tagged `[quarantine]`. The main `pnpm test` run
+  skips it.
+- `pnpm test:quarantine` runs only quarantined blocks, with `retry: 3`.
+- New non-blocking `quarantine` CI job (`continue-on-error: true`). Its job
+  summary lists each quarantined test, its issue, and the outcome.
+- `tests/quarantine.test.ts` fails if a `quarantine()` call has no GitHub issue URL.
+
+### Maintenance — removed the unused `turbo.json`
+
+- Turborepo was never installed or invoked: `pnpm typecheck` is one `tsc` pass
+  and `pnpm test` is one `vitest run`. `turbo.json` and the `.turbo` entries in
+  `.gitignore`, `.prettierignore` and `eslint.config.js` are gone, so nobody
+  assumes there is task caching
+  ([#285](https://github.com/ezedike-evan/corridor-in-a-box/issues/285)).
+
+### Added — every service request carries an `X-Request-Id` into the logs and the audit trail ([#269](https://github.com/ezedike-evan/corridor-in-a-box/issues/269))
+
+Engine logs and audit entries only carried `idempotencyKey` and `corridorId`,
+and the service neither assigned nor returned a request id — so an operator
+handed a `500` and a log file had no way to tie the two together.
+
+- `packages/service`: `server()` accepts an inbound `X-Request-Id` and echoes
+  it back on every response, including the transport-owned ones (413, 400 from
+  invalid JSON, 401, 404, 429, 500). An inbound id is used only if it is
+  `[A-Za-z0-9._-]{1,128}`; anything else is replaced with a fresh
+  `crypto.randomUUID()`, so a client cannot inject a log line or a header.
+- `packages/service`: `RouteResponse` gained `headers`, and `RouteRequest`
+  gained `requestId` / `traceparent`, so `route()` stays a pure function that
+  can be driven without a socket.
+- `packages/service`: a W3C `traceparent` is validated and passed through as a
+  field on the response and on every log line (full tracing is a separate
+  concern).
+- `packages/engine`: `ExecuteOptions.requestId` / `traceparent` scope the run —
+  `Logger.child(fields)` (new optional member, with `childLogger()` falling back
+  to merging for third-party loggers) and `scopedAuditSink()` wrap the deps once,
+  so _every_ emit site of a run inherits the id: transitions, the pre-settle
+  gate detail, reconcile polls, halt notices. `AuditEntry` and `AuditDetail`
+  gained optional `requestId` / `traceparent`.
+
+### Breaking — `StellarSettlementSubmitter` refuses mainnet unless it is opted in ([#275](https://github.com/ezedike-evan/corridor-in-a-box/issues/275))
+
+The "don't move real money by accident" check lived only in the example
+launchers (`examples/run-testnet.ts`, `examples/run-service.ts`,
+`scripts/assert-testnet-corridor.ts`), so an embedder wiring the library
+together themselves inherited no guard at all: the submitter picked the network
+straight from the manifest and signed whatever `settlement.network` said.
+
+- `packages/stellar`: `StellarSubmitterOptions.allowedNetworks`
+  (`readonly ("public" | "testnet")[]`) **defaults to `["testnet"]`**. A
+  corridor on a network that is not listed is refused with a non-retryable
+  `SETTLEMENT_FAILED` before `loadAccount()`, so a refusal costs no sequence
+  number, no signature and no transaction. **Embedders that settle on public
+  must now pass `allowedNetworks: ["testnet", "public"]`** — that is the whole
+  point, but it is a breaking construction-time change.
+- `packages/stellar`: a `LocalKeypairSigner` (including one built from
+  `signerSecret`) is refused on public unless `allowLocalSignerOnMainnet: true`
+  is also passed, per docs/key-management.md: a seed living in the application
+  process is a testnet convenience, not a mainnet custody model.
+- `packages/stellar`: the Horizon endpoint's own `network_passphrase` is read
+  from its root resource once, lazily, and compared with the corridor's
+  network — a testnet manifest pointed at a mainnet Horizon (or the reverse)
+  is refused rather than signed. An endpoint that cannot be reached fails
+  retryably; nothing was submitted, so retrying is safe. `fetchHorizonRoot` is
+  the test seam; the check is skipped when a fake `horizonServer` is injected
+  without it.
+- `examples/run-service.ts` and `examples/run-testnet.ts`: the submitter is
+  constructed with `allowedNetworks` derived from `CORRIDOR_ALLOW_MAINNET=1`,
+  so the launcher's opt-in and the signer's guard cannot drift apart.
+- `tests/stellar.test.ts`: public corridor without opt-in → refused with no
+  `loadAccount` call; local signer on public refused even with the network
+  allowed; explicit ack settles; endpoint/corridor passphrase mismatch refused
+  (root read once); unverifiable endpoint retryable.
+
+### Added — `tests/service-http.test.ts`: the service transport, tested over a socket ([#281](https://github.com/ezedike-evan/corridor-in-a-box/issues/281))
+
+`tests/service.test.ts` drives the pure `route()` in-process, which is the right
+way to test routing — but the transport in `server()` was mostly invisible to
+it: JSON parsing, the lowercasing of inbound headers, `resolveClientIp()` /
+`trustProxy`, the content types written on the way out, and the catch-all that
+turns an unexpected throw into a 500. Only the two body-size cases went through
+a real socket.
+
+- New black-box suite: mock adapters, mock submitter, a server on port 0, and
+  assertions on status bytes, headers and response bodies. It covers POST
+  `/payments` → 200 and reading that key back, 401 without a key, a mixed-case
+  `Authorization` still authenticating, a cross-tenant `GET /payments/:key` →
+  404, 429 after the token bucket drains, `/metrics` served as
+  `text/plain; version=0.0.4` verbatim and unmetered, a forged
+  `X-Forwarded-For` ignored by default and honoured under `trustProxy`, invalid
+  JSON → 400, and a rejecting store → 500 with the same server still answering
+  the next request.
+- Servers are closed through `gracefulShutdown()` in `afterEach`, not
+  `server.close()`, so nothing outlives the test.
+- 12 tests, ~0.3 s. No production code changed.
+
 ### Fixed — `web/` reads corridor data and the state list from the repo, not hand copies ([#293](https://github.com/ezedike-evan/corridor-in-a-box/issues/293))
 
 `web/lib/corridors.ts` had hand-copied four of the six manifests and kept its

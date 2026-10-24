@@ -220,7 +220,7 @@ export interface PollOptions {
 //     `RECONCILE_STALLED` — the anchor is stuck, not slow. This lets the engine
 //     recover (refund/hold) long before the corridor deadline expires.
 export async function reconcileUntil(
-  adapter: AnchorAdapter,
+  adapter: Pick<AnchorAdapter, "getTransaction">,
   transactionId: string,
   opts: PollOptions,
 ): Promise<Outcome<TransactionStatus>> {

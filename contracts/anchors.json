@@ -66,6 +66,11 @@
     "(vibrant.cash returns marketing HTML without anchor SEPs). Vibrant is a wallet,",
     "not an anchor, and serves no SEP-31 receive endpoint; no manifest is written.",
     "",
+    "anclap.com.ar is Anclap (Argentina / LatAm, ARS and other LatAm payouts), added",
+    "from the Stellar Anchor Directory for issue #231. Probe output and directory link",
+    "are recorded in the PR; no SEP-31 receive side has been verified, so no corridor",
+    "manifest is written. Blocked on SEP-6/SEP-24 unless the probe shows otherwise.",
+    "",
     "testanchor.stellar.org is the SDF test anchor. It currently advertises SEP-31",
     "and returns an empty receive list, so it attests as NOT serving SEP-31 — a",
     "useful demonstration that the registry reports capability rather than claims.",
@@ -76,10 +81,21 @@
     "or a CNY/CNH/HKD asset; see corridors/ng-cn.corridor.yaml for the probe results",
     "of 2026-10-18. Their countries are the directory's listing, not attested facts.",
     "",
+    "MoneyGram Access (stellar.moneygram.com; https://anchors.stellar.org/?search=MoneyGram)",
+    "was probed 2026-10-22: TOML advertises SEP-1/10/24 and USDC; TOML fetch passes,",
+    "SEP-10 challenge returns HTTP 400, and no SEP-31 receive endpoint is published.",
+    "No corridor manifest is written; blocked on SEP-6/24 adapter support.",
+    "",
     "flutterwave.com is Flutterwave (Nigeria/Africa payments provider). Not listed",
     "in anchors.stellar.org (https://anchors.stellar.org/?search=Flutterwave).",
     "Probed 2026-10-19: toml_fetch returns HTTP 404 (https://flutterwave.com/.well-known/stellar.toml).",
     "Flutterwave publishes no Stellar anchor or SEP-31 receive endpoint; no manifest is written.",
+    "",
+    "bitso.com is Bitso (Argentina, Brazil, Colombia, Mexico; sourced from",
+    "https://anchors.stellar.org/?search=Bitso, where the entry claims SEP-31 and",
+    "website https://bitso.com/ with toml_file null). Probed 2026-10-22: toml_fetch",
+    "returns HTTP 404 (https://bitso.com/.well-known/stellar.toml), so no SEP-31",
+    "receive capability was verified and no corridor manifest was written.",
     "",
     "Each entry in `anchors` records curator-declared context (name, ISO 3166-1",
     "alpha-2 countries, kind, directory/manifest source, and date added). Countries",
@@ -97,13 +113,15 @@
     "connect.clickpesa.com",
     "coins.ph",
     "vibrantapp.com",
+    "anclap.com.ar",
     "stellar.moneygram.com",
     "mercuryo.io",
     "lightnet.io",
     "owlting.com",
     "arf.one",
     "stellar-sep-24.banxa.com",
-    "flutterwave.com"
+    "flutterwave.com",
+    "bitso.com"
   ],
   "anchors": [
     {
@@ -187,6 +205,14 @@
       "added": "2026-10-17"
     },
     {
+      "domain": "anclap.com.ar",
+      "name": "Anclap",
+      "countries": ["AR"],
+      "kind": "offramp",
+      "source": "https://anchors.stellar.org",
+      "added": "2026-10-20"
+    },
+    {
       "domain": "stellar.moneygram.com",
       "name": "MoneyGram Ramps",
       "countries": ["HK", "SG"],
@@ -241,6 +267,14 @@
       "kind": "other",
       "source": "https://flutterwave.com",
       "added": "2026-10-19"
+    },
+    {
+      "domain": "bitso.com",
+      "name": "Bitso",
+      "countries": ["AR", "BR", "CO", "MX"],
+      "kind": "other",
+      "source": "https://anchors.stellar.org/?search=Bitso",
+      "added": "2026-10-22"
     }
   ]
 }

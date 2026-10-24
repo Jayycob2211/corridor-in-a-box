@@ -17,7 +17,7 @@ export default tseslint.config(
     // Revisit a move back to typescript-eslint type-aware rules once it
     // supports TS >=7.1:
     // https://github.com/typescript-eslint/typescript-eslint/issues/10940
-    ignores: ["**/dist/**", "**/node_modules/**", "**/.turbo/**", "web/**"],
+    ignores: ["**/dist/**", "**/node_modules/**", "web/**"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

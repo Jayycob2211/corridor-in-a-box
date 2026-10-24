@@ -418,6 +418,169 @@ describe("StellarSettlementSubmitter.fee", () => {
   });
 });
 
+describe("StellarSettlementSubmitter.submit — mainnet guard", () => {
+  // The guard belongs to the class that signs, not to the example launchers: an
+  // embedder who never runs `examples/run-testnet.ts` must still not be able to
+  // move real money because a manifest said `network: "public"`.
+  const onPublic = (): SettlementRequest => {
+    const base = testCorridor();
+    return {
+      ...testRequest(),
+      corridor: { ...base, settlement: { ...base.settlement, network: "public" } },
+    };
+  };
+  /** A KMS-shaped signer, so the local-key rule below is the only thing deciding. */
+  const kmsSigner = (): { signer: ExternalSigner } => {
+    const kp = Keypair.random();
+    return {
+      signer: { publicKey: kp.publicKey(), sign: async (data) => kp.sign(Buffer.from(data)) },
+    };
+  };
+  const refusingServer = () =>
+    fakeServer({
+      submitTransaction: async () => {
+        throw new Error("must not be reached");
+      },
+    });
+
+  it("refuses a public corridor by default, before loading the account", async () => {
+    const server = refusingServer();
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      // A policy refusal is final: the engine must not burn retries on it.
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain('refusing to settle on network "public"');
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+    expect(server.submitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("settles a public corridor once the network is opted into", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => ({ successful: true }),
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 7 }),
+    });
+    const sub = new StellarSettlementSubmitter({
+      horizonUrl: "unused",
+      horizonServer: server,
+      allowedNetworks: ["public"],
+      ...kmsSigner(),
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(true);
+    if (r.ok && r.value.kind === "stellar") expect(r.value.ledger).toBe(7);
+    expect(server.loadAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses to sign a public settlement with a local key, even when public is allowed", async () => {
+    const server = refusingServer();
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      allowedNetworks: ["public"],
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain("LocalKeypairSigner");
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+  });
+
+  it("accepts a local key on public only under an explicit allowLocalSignerOnMainnet", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => ({ successful: true }),
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 8 }),
+    });
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      allowedNetworks: ["public"],
+      allowLocalSignerOnMainnet: true,
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(true);
+  });
+
+  it("refuses when the Horizon endpoint serves a different network than the corridor", async () => {
+    const server = refusingServer();
+    const root = vi.fn(async () => ({ network_passphrase: Networks.PUBLIC }));
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      horizonServer: server,
+      fetchHorizonRoot: root,
+    });
+
+    // testCorridor() is testnet; the endpoint claims to be mainnet.
+    const r = await sub.submit(testRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain(Networks.PUBLIC);
+      expect(r.error.message).toContain(Networks.TESTNET);
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+    // The root resource is read once and memoised, not re-fetched per payment.
+    await sub.submit(testRequest());
+    expect(root).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails retryably when the endpoint network cannot be verified", async () => {
+    const server = refusingServer();
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      horizonServer: server,
+      fetchHorizonRoot: async () => {
+        throw new Error("ECONNREFUSED");
+      },
+    });
+
+    const r = await sub.submit(testRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      // Nothing was built, signed or submitted, so trying again is safe.
+      expect(r.error.retryable).toBe(true);
+      expect(r.error.message).toContain("cannot verify the network");
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+  });
+
+  it("settles a testnet corridor whose endpoint declares the testnet passphrase", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => ({ successful: true }),
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 9 }),
+    });
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      horizonServer: server,
+      fetchHorizonRoot: async () => ({ network_passphrase: Networks.TESTNET }),
+    });
+
+    const r = await sub.submit(testRequest());
+    expect(r.ok).toBe(true);
+  });
+});
+
 describe("StellarClaimableBalanceStrategy", () => {
   it("exposes kind claimable_balance", () => {
     const strat = new StellarClaimableBalanceStrategy({

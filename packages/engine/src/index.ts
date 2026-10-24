@@ -39,6 +39,7 @@ export {
   type CorridorHealthStore,
   type RecordOutcomeOptions,
 } from "./breaker";
+export { PostgresAuditSink, CREATE_AUDIT_TABLE_SQL } from "./audit-pg";
 export {
   PostgresCorridorHealthStore,
   CREATE_BREAKERS_TABLE_SQL,
@@ -91,6 +92,8 @@ export {
 export {
   consoleLogger,
   silentLogger,
+  childLogger,
+  scopedAuditSink,
   InMemoryAuditLog,
   InMemoryAlerting,
   WebhookAlerting,
@@ -101,6 +104,7 @@ export {
   type Logger,
   type LogLevel,
   type LogFields,
+  type RequestScope,
   type AuditSink,
   type AuditEntry,
   type AuditDetail,

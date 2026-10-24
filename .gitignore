@@ -2,7 +2,6 @@ node_modules/
 dist/
 .next/
 *.tsbuildinfo
-.turbo/
 *.log
 .DS_Store
 .env

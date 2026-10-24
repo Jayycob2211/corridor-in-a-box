@@ -55,11 +55,13 @@ import {
 import {
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
+  PostgresAuditSink,
   PostgresIdempotencyStore,
   PrometheusMetrics,
   consoleLogger,
   defaultSep31Gate,
   migrate,
+  type AuditSink,
   type EngineDeps,
   type IdempotencyStore,
 } from "@corridor/engine";
@@ -80,9 +82,14 @@ function corridorsDir(): string {
   return d.startsWith("/") ? d : fileURLToPath(new URL(`../${d}`, import.meta.url));
 }
 
+/** The single opt-in for real money, shared by the corridor filter and the submitter. */
+function allowMainnet(): boolean {
+  return process.env.CORRIDOR_ALLOW_MAINNET === "1";
+}
+
 function loadCorridors(): Map<string, Corridor> {
   const dir = corridorsDir();
-  const allowMainnet = process.env.CORRIDOR_ALLOW_MAINNET === "1";
+  const mainnet = allowMainnet();
   const map = new Map<string, Corridor>();
   for (const f of readdirSync(dir)) {
     if (!f.endsWith(".corridor.yaml")) continue;
@@ -92,7 +99,7 @@ function loadCorridors(): Map<string, Corridor> {
       continue;
     }
     const c = loaded.value;
-    if (c.settlement.network === "public" && !allowMainnet) {
+    if (c.settlement.network === "public" && !mainnet) {
       console.warn(
         `• skipping "${c.id}": settles on MAINNET (network=public). Set ` +
           `CORRIDOR_ALLOW_MAINNET=1 to serve it — this moves real money.`,
@@ -104,17 +111,29 @@ function loadCorridors(): Map<string, Corridor> {
   return map;
 }
 
-async function buildStore(): Promise<{ store: IdempotencyStore; close: () => Promise<void> }> {
+async function buildStore(): Promise<{
+  store: IdempotencyStore;
+  audit: AuditSink;
+  close: () => Promise<void>;
+}> {
   const dbUrl = process.env.DATABASE_URL;
   if (!dbUrl) {
-    console.log("• idempotency: in-memory (set DATABASE_URL for a durable run)");
-    return { store: new InMemoryIdempotencyStore(), close: async () => {} };
+    console.log("• idempotency + audit: in-memory (set DATABASE_URL for a durable run)");
+    return {
+      store: new InMemoryIdempotencyStore(),
+      audit: new InMemoryAuditLog(),
+      close: async () => {},
+    };
   }
   const { Pool } = await import("pg");
   const pool = new Pool({ connectionString: dbUrl });
   await migrate(pool);
-  console.log("• idempotency: Postgres (migrated)");
-  return { store: new PostgresIdempotencyStore(pool), close: () => pool.end() };
+  console.log("• idempotency + audit: Postgres (migrated)");
+  return {
+    store: new PostgresIdempotencyStore(pool),
+    audit: new PostgresAuditSink(pool),
+    close: () => pool.end(),
+  };
 }
 
 /**
@@ -201,8 +220,15 @@ async function main(): Promise<void> {
   console.log(`• signer: ${signerKind} (${signer.publicKey})`);
   const horizonUrl = env("HORIZON_URL", "https://horizon-testnet.stellar.org");
   const sep10 = new StellarSep10Signer(signer);
-  const submitter = new StellarSettlementSubmitter({ signer, horizonUrl });
-  const { store, close } = await buildStore();
+  // The per-corridor filter above only decides what gets _served_; this is the
+  // guard that decides what can be _signed_. Both hang off the same opt-in, so
+  // the submitter can never be looser than the launcher (see @corridor/stellar).
+  const submitter = new StellarSettlementSubmitter({
+    signer,
+    horizonUrl,
+    allowedNetworks: allowMainnet() ? ["testnet", "public"] : ["testnet"],
+  });
+  const { store, audit, close } = await buildStore();
   const metrics = new PrometheusMetrics();
   const adapters = buildAdapterRegistry(sep10);
   validateCorridors(corridors, adapters);
@@ -214,7 +240,7 @@ async function main(): Promise<void> {
     resolver,
     submitter,
     idempotency: store,
-    audit: new InMemoryAuditLog(),
+    audit,
     logger: consoleLogger,
     metrics,
     trustManifestWithoutAttestation: true,

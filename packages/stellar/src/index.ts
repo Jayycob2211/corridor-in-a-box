@@ -170,6 +170,49 @@ export interface StellarSubmitterOptions {
   /** Injectable clock/sleep for tests. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Networks this submitter may settle on. **Default `["testnet"]`** — moving
+   * real money has to be a decision, not a manifest typo. A corridor whose
+   * `settlement.network` is not listed is refused before the account is loaded
+   * and before anything is signed.
+   *
+   * Set `["testnet", "public"]` (or `["public"]`) deliberately: this is the
+   * guard that used to live only in the example launchers, which an embedder
+   * using the library directly never inherited.
+   */
+  allowedNetworks?: readonly StellarNetwork[];
+  /**
+   * Permit a `LocalKeypairSigner` (an in-process seed, including one built from
+   * `signerSecret`) to sign on the public network. Default `false`: per
+   * docs/key-management.md the mainnet seed belongs in a KMS/HSM, so a dev key
+   * must not be able to move mainnet funds even after `allowedNetworks` says the
+   * network is fine.
+   */
+  allowLocalSignerOnMainnet?: boolean;
+  /**
+   * Test seam for the Horizon-root check (see `allowedNetworks`). Called once,
+   * lazily, to read the endpoint's `network_passphrase`.
+   *
+   * Defaults to a real fetch against `horizonUrl` — and is skipped entirely when
+   * `horizonServer` is injected without one, because a fake server means the URL
+   * is not the transport actually talking to.
+   */
+  fetchHorizonRoot?: (url: string) => Promise<HorizonRoot>;
+}
+
+/** The networks a corridor manifest can name, and a submitter can be allowed on. */
+export type StellarNetwork = "public" | "testnet";
+
+/** The part of Horizon's root resource this package reads. */
+export interface HorizonRoot {
+  readonly network_passphrase?: string;
+}
+
+/** Read the root resource of a real Horizon endpoint over HTTP. */
+async function defaultFetchHorizonRoot(url: string): Promise<HorizonRoot> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as HorizonRoot;
 }
 
 class AsyncLock {
@@ -283,6 +326,13 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
    *  confirm() poll, so one ambiguous submission doesn't head-of-line-block
    *  every other in-flight payment from this signer. */
   private readonly lock = new AsyncLock();
+  private readonly allowedNetworks: readonly StellarNetwork[];
+  private readonly allowLocalSignerOnMainnet: boolean;
+  private readonly horizonUrl: string;
+  /** Undefined when the endpoint's declared network cannot be read (fake server). */
+  private readonly rootFetcher?: (url: string) => Promise<HorizonRoot>;
+  /** Memoised `network_passphrase` of the endpoint — the root is read once. */
+  private rootPassphrase?: string;
 
   constructor(opts: StellarSubmitterOptions) {
     if (!opts.signer && !opts.signerSecret) {
@@ -306,13 +356,91 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
       );
     }
     this.fee = fee;
+    this.allowedNetworks = opts.allowedNetworks ?? ["testnet"];
+    this.allowLocalSignerOnMainnet = opts.allowLocalSignerOnMainnet ?? false;
+    this.horizonUrl = opts.horizonUrl;
+    this.rootFetcher =
+      opts.fetchHorizonRoot ?? (opts.horizonServer ? undefined : defaultFetchHorizonRoot);
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     return this.lock.withLock(fn);
   }
 
+  /**
+   * Fail closed before a signature is produced when this submitter is not
+   * allowed to move money on the corridor's network. Three independent checks,
+   * because they stop three different accidents:
+   *
+   * 1. `allowedNetworks` — the "I did not mean to run on mainnet" typo. This is
+   *    opt-in by design: the default is testnet-only, so an embedder has to ask
+   *    for real money.
+   * 2. the signer kind — a seed sitting in the process belongs to a throwaway
+   *    testnet key (docs/key-management.md), so mainnet needs both the network
+   *    opt-in AND an explicit ack that a dev key is acceptable here.
+   * 3. the endpoint's own `network_passphrase` — a testnet manifest pointed at a
+   *    mainnet Horizon (or the reverse) would otherwise sign a transaction whose
+   *    hash is meaningless to the network it lands on.
+   *
+   * Everything here runs before `loadAccount`, so a refusal costs no sequence
+   * number, no signature and no transaction.
+   */
+  private async guardNetwork(network: StellarNetwork): Promise<Outcome<void>> {
+    if (!this.allowedNetworks.includes(network)) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `refusing to settle on network "${network}": this submitter allows ` +
+          `[${this.allowedNetworks.join(", ")}]. Settling real money is opt-in — pass ` +
+          `allowedNetworks: ["testnet", "public"] only if you mean it.`,
+        { retryable: false },
+      );
+    }
+    if (network === "public" && this.signer instanceof LocalKeypairSigner) {
+      if (!this.allowLocalSignerOnMainnet) {
+        return fail(
+          "SETTLEMENT_FAILED",
+          `refusing to sign a public-network settlement with a LocalKeypairSigner: the seed ` +
+            `would live in this process. Use a KMS/HSM-backed ExternalSigner (see ` +
+            `docs/key-management.md), or pass allowLocalSignerOnMainnet: true deliberately.`,
+          { retryable: false },
+        );
+      }
+    }
+    if (!this.rootFetcher) return ok(undefined);
+
+    if (this.rootPassphrase === undefined) {
+      let root: HorizonRoot;
+      try {
+        root = await this.rootFetcher(this.horizonUrl);
+      } catch (cause) {
+        // Nothing was built, signed or submitted, so a retry is safe — but the
+        // run must not proceed on an endpoint we could not place.
+        return fail(
+          "SETTLEMENT_FAILED",
+          `cannot verify the network of Horizon ${this.horizonUrl} ` +
+            `(root resource unreadable: ${describe(cause)}); refusing to sign`,
+          { retryable: true, cause },
+        );
+      }
+      this.rootPassphrase = root.network_passphrase ?? "";
+    }
+    const expected = passphraseFor(network);
+    if (this.rootPassphrase !== expected) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `Horizon ${this.horizonUrl} serves "${this.rootPassphrase || "unknown"}" but this ` +
+          `corridor settles on "${expected}" (${network}); refusing to sign a ` +
+          `transaction for the wrong network`,
+        { retryable: false },
+      );
+    }
+    return ok(undefined);
+  }
+
   async submit(req: SettlementRequest): Promise<Outcome<SettlementRef>> {
+    const guarded = await this.guardNetwork(req.corridor.settlement.network);
+    if (!guarded.ok) return guarded;
+
     const now = this.now();
     if (req.validUntil !== undefined && req.validUntil <= now) {
       return fail("QUOTE_EXPIRED", `quote expired at ${req.validUntil} (now=${now})`, {

@@ -607,6 +607,45 @@ export interface AnchorAdapter {
   ): Promise<Outcome<RefundRef>>;
 }
 
+/**
+ * Adapter for the source anchor's deposit/on-ramp transaction.
+ * `openDeposit` must be idempotent on `intent.idempotencyKey`, so a crash
+ * after the source accepts the deposit but before its id is stored is safe to
+ * resume.
+ */
+export interface SourceAnchorAdapter {
+  openDeposit(
+    intent: PaymentIntent,
+    corridor: Corridor,
+  ): Promise<Outcome<{ transactionId: string }>>;
+  getDeposit(transactionId: string): Promise<Outcome<TransactionStatus>>;
+}
+
+/** Configurable source adapter for engine tests. */
+export function createMockSourceAdapter(
+  opts: { settled?: boolean } = {},
+): SourceAnchorAdapter {
+  let counter = 0;
+  const deposits = new Map<string, boolean>();
+  const byKey = new Map<string, string>();
+  return {
+    async openDeposit(intent) {
+      const existing = byKey.get(intent.idempotencyKey);
+      if (existing) return ok({ transactionId: existing });
+      const transactionId = `source-deposit-${++counter}`;
+      deposits.set(transactionId, opts.settled ?? true);
+      byKey.set(intent.idempotencyKey, transactionId);
+      return ok({ transactionId });
+    },
+    async getDeposit(transactionId) {
+      const settled = deposits.get(transactionId);
+      if (settled === undefined)
+        return fail("ANCHOR_UNAVAILABLE", `unknown source deposit ${transactionId}`);
+      return ok({ status: settled ? "completed" : "pending_sender", settled });
+    },
+  };
+}
+
 // --- Conformance ---------------------------------------------------------
 // Any adapter — generic or bespoke — should pass the same probes before you
 // trust it in a corridor. This is intentionally minimal; grow it as you learn

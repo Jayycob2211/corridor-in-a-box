@@ -23,6 +23,9 @@ timeline within **7 days**.
 
 ## Scope
 
+For a comprehensive breakdown of defended assets, actors, trust boundaries,
+and code-level mitigations, see the [Threat Model](docs/threat-model.md).
+
 Of particular interest:
 
 - **Double-settlement / idempotency bypass** — any path where the same

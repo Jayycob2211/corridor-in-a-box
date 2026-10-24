@@ -1,0 +1,43 @@
+{
+  "name": "corridor-in-a-box",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  // docker-compose.yml mounts the repository itself at /workspaces, so that is
+  // the workspace root (there is no per-repository subdirectory underneath it).
+  "workspaceFolder": "/workspaces",
+  "remoteUser": "node",
+
+  "features": {
+    // Same toolchain as CI's contracts job (.github/workflows/ci.yml):
+    // dtolnay/rust-toolchain@stable with rustfmt + clippy and the wasm32v1-none
+    // target. rustup's minimal profile plus this feature's default components
+    // (rust-analyzer, rust-src, rustfmt, clippy) covers it, and the wasm target
+    // is what `cargo build --release --target wasm32v1-none` needs.
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "stable",
+      "targets": "wasm32v1-none"
+    }
+  },
+
+  "containerEnv": {
+    // pnpm is fetched by corepack on first use. Without this, that download can
+    // stop at corepack's confirmation prompt, and postCreateCommand has no TTY.
+    "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"
+  },
+
+  // Runs once, as `node`, after the features are installed. pnpm is not pinned
+  // here: corepack reads `packageManager` from package.json and resolves
+  // pnpm@9.12.0, so the repository stays the single source of truth. The shim
+  // goes next to the node binary, which needs root — the image installs its own
+  // pnpm under /usr/local/share/npm-global (later on PATH), so the corepack shim
+  // takes precedence. `command -v` because sudo's secure_path need not include
+  // the nvm bin directory corepack lives in.
+  "onCreateCommand": "sudo \"$(command -v corepack)\" enable pnpm",
+
+  // Both pnpm roots. web/ is intentionally its own workspace root with its own
+  // lockfile, hence --ignore-workspace (see web/README.md).
+  "postCreateCommand": "pnpm install && (cd web && pnpm install --ignore-workspace)",
+
+  // `pnpm dev` in web/ and @corridor/service (`pnpm serve`) respectively.
+  "forwardPorts": [3000, 8080]
+}

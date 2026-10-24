@@ -74,6 +74,9 @@ another transfer SEP is a new adapter, not an engine change:
   which is why it is out of scope today. See
   [docs/protocols/sep24.md](./protocols/sep24.md) for a full breakdown of the
   SEP-24 interactive lifecycle, state-machine implications, and options considered.
+  Anchors that publish only SEP-6/SEP-24 (for example Anclap, pending the probe
+  recorded in the issue) are blocked on the SEP-6 adapter and cannot yet be
+  onboarded as SEP-31 corridors.
 
 ## External quotes (`fx.quote_source: external`)
 

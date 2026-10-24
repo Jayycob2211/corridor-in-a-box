@@ -6,11 +6,13 @@ import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
 import {
+  InMemoryAuditLog,
   InMemoryIdempotencyStore,
   createMockSubmitter,
   type EngineDeps,
+  type Logger,
 } from "@corridor/engine";
-import { createService, type ServiceOptions } from "@corridor/service";
+import { createService, gracefulShutdown, type ServiceOptions } from "@corridor/service";
 import type { CorridorErrorCode, PaymentIntent } from "@corridor/types";
 
 function corridor(): Corridor {
@@ -358,6 +360,556 @@ describe("service: body-size limit (HTTP server)", () => {
       expect(r.status).toBe(413);
     } finally {
       close();
+    }
+  });
+});
+
+describe("service: auth + rate limiting + health", () => {
+  it("healthz is public", async () => {
+    const r = await svc({ apiKeys: new Set(["secret"]) }).route({
+      method: "GET",
+      path: "/healthz",
+    });
+    expect(r.status).toBe(200);
+  });
+
+  it("serves /metrics as text when a renderer is configured, public + unmetered", async () => {
+    const s = svc({
+      apiKeys: new Set(["secret"]),
+      rateLimit: { capacity: 0, refillPerSec: 0 }, // would 429 everything if metered
+      metricsText: () => "# TYPE corridor_transition counter\ncorridor_transition 3\n",
+    });
+    const r = await s.route({ method: "GET", path: "/metrics" });
+    expect(r.status).toBe(200);
+    expect(r.contentType).toContain("text/plain");
+    expect(r.body).toContain("corridor_transition 3");
+  });
+
+  it("404s /metrics when no renderer is configured", async () => {
+    const r = await svc().route({ method: "GET", path: "/metrics" });
+    expect(r.status).toBe(404);
+  });
+
+  it("rejects requests without a valid API key", async () => {
+    const s = svc({ apiKeys: new Set(["secret"]) });
+    const noKey = await s.route({ method: "POST", path: "/payments", body: intentBody() });
+    expect(noKey.status).toBe(401);
+    const good = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody(),
+      headers: { authorization: "Bearer secret" },
+    });
+    expect(good.status).toBe(200);
+  });
+
+  it("rate-limits after the bucket is drained", async () => {
+    let t = 0;
+    const s = svc({ rateLimit: { capacity: 2, refillPerSec: 0 }, now: () => t });
+    const hit = () =>
+      s.route({
+        method: "GET",
+        path: "/payments/x",
+        headers: { "x-forwarded-for": "1.1.1.1" },
+      });
+    expect((await hit()).status).toBe(404); // allowed (token 1)
+    expect((await hit()).status).toBe(404); // allowed (token 2)
+    expect((await hit()).status).toBe(429); // drained
+    t += 100; // no refill configured
+    expect((await hit()).status).toBe(429);
+  });
+
+  it("keys the rate limiter per resolved client IP", async () => {
+    const s = svc({ rateLimit: { capacity: 1, refillPerSec: 0 } });
+    const hit = (clientIp: string) =>
+      s.route({ method: "GET", path: "/payments/x", clientIp });
+    expect((await hit("10.0.0.1")).status).toBe(404); // client A's only token
+    expect((await hit("10.0.0.1")).status).toBe(429); // A drained
+    expect((await hit("10.0.0.2")).status).toBe(404); // B has its own bucket
+  });
+
+  it("does not let a forged X-Forwarded-For mint fresh buckets", async () => {
+    // Without trustProxy the raw header is ignored for keying, so spoofing it
+    // can't dodge the limit — all such requests share the 'anon' bucket.
+    const s = svc({ rateLimit: { capacity: 1, refillPerSec: 0 } });
+    const hit = (xff: string) =>
+      s.route({ method: "GET", path: "/payments/x", headers: { "x-forwarded-for": xff } });
+    expect((await hit("9.9.9.1")).status).toBe(404);
+    expect((await hit("9.9.9.2")).status).toBe(429); // different forged IP, still limited
+  });
+
+  it("uses an injected (async, shared-style) limiter over the default", async () => {
+    const seen: string[] = [];
+    let allow = true;
+    const s = svc({
+      // The shape a Redis-backed limiter would have: async take().
+      rateLimiter: {
+        async take(key: string) {
+          seen.push(key);
+          return allow;
+        },
+      },
+    });
+    const hit = () => s.route({ method: "GET", path: "/payments/x", clientIp: "5.5.5.5" });
+    expect((await hit()).status).toBe(404);
+    allow = false;
+    expect((await hit()).status).toBe(429);
+    expect(seen).toEqual(["ip:5.5.5.5", "ip:5.5.5.5"]);
+  });
+});
+
+describe("service documentation sync", () => {
+  it("documents every CorridorErrorCode, HTTP status code, and GET /metrics in web docs", async () => {
+    const { docs } = await import("../web/lib/docs.js");
+    const httpApiDoc = docs.find((d) => d.slug === "http-api");
+    expect(httpApiDoc).toBeDefined();
+    const body = httpApiDoc!.body;
+
+    const errorCodes: CorridorErrorCode[] = [
+      "MANIFEST_INVALID",
+      "AMOUNT_INVALID",
+      "QUOTE_UNAVAILABLE",
+      "QUOTE_EXPIRED",
+      "KYC_REQUIRED",
+      "KYC_REJECTED",
+      "ANCHOR_UNAVAILABLE",
+      "SETTLEMENT_FAILED",
+      "SETTLEMENT_TIMEOUT",
+      "REFUND_UNSUPPORTED",
+      "RECONCILE_MISMATCH",
+      "RECONCILE_STALLED",
+      "IDEMPOTENCY_CONFLICT",
+    ];
+
+    for (const code of errorCodes) {
+      expect(body).toContain(code);
+    }
+
+    const expectedStatuses = [
+      "200",
+      "400",
+      "401",
+      "403",
+      "404",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "501",
+      "502",
+      "504",
+    ];
+    for (const status of expectedStatuses) {
+      expect(body).toContain(`\`${status}\``);
+    }
+
+    expect(body).toContain("GET /metrics");
+  });
+});
+
+import { CallbackVerifier } from "@corridor/service";
+import { vi } from "vitest";
+import { InMemoryWaker } from "@corridor/engine";
+
+describe("service: POST /callbacks/sep31/:corridorId", () => {
+  it("callback wakes a pending reconcile", async () => {
+    const waker = new InMemoryWaker();
+    const s = createService({
+      corridors: new Map([["test", corridor()]]),
+      deps: { ...deps(), waker },
+    });
+
+    const origFetch = global.fetch;
+    const spy = vi.spyOn(CallbackVerifier.prototype, "verify").mockResolvedValue(true);
+    global.fetch = (async () => ({
+      ok: true,
+      text: async () =>
+        'SIGNING_KEY="GB5K2F7N7XZK22RKV4K7XZK22RKV4K7XZK22RKV4K7XZK22RKV4K7XZK22"',
+    })) as unknown as typeof fetch;
+
+    try {
+      let woken = false;
+      waker.signal("tx-123").addEventListener("abort", () => {
+        woken = true;
+      });
+
+      const tStr = Math.floor(Date.now() / 1000).toString();
+      const r = await s.route({
+        method: "POST",
+        path: "/callbacks/sep31/test",
+        headers: { signature: `t=${tStr}, s=abc` },
+        body: { transaction: { id: "tx-123" } },
+        rawBody: '{"transaction":{"id":"tx-123"}}',
+      });
+
+      if (r.status !== 200) console.log(r);
+      expect(r.status).toBe(200);
+      expect(woken).toBe(true);
+    } finally {
+      global.fetch = origFetch;
+      spy.mockRestore();
+    }
+  });
+
+  it("unsigned callback 401", async () => {
+    const s = createService({ corridors: new Map([["test", corridor()]]), deps: deps() });
+    const r = await s.route({
+      method: "POST",
+      path: "/callbacks/sep31/test",
+      body: { transaction: { id: "tx-123" } },
+    });
+    expect(r.status).toBe(401);
+  });
+});
+
+import { storeCheck } from "@corridor/service";
+
+describe("service: GET /readyz", () => {
+  it("returns 200 when all checks pass", async () => {
+    const s = svc({
+      readinessChecks: [
+        { name: "db", check: async () => {} },
+        { name: "cache", check: async () => {} },
+      ],
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(200);
+    expect((r.body as { status: string }).status).toBe("ok");
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([
+      { name: "db", ok: true },
+      { name: "cache", ok: true },
+    ]);
+  });
+
+  it("returns 503 when a check throws", async () => {
+    const s = svc({
+      readinessChecks: [
+        {
+          name: "db",
+          check: async () => {
+            throw new Error("connection refused");
+          },
+        },
+      ],
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    expect((r.body as { status: string }).status).toBe("degraded");
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([{ name: "db", ok: false }]);
+  });
+
+  it("returns 503 when a check times out", async () => {
+    const s = svc({
+      readinessChecks: [
+        // never resolves
+        { name: "slow", check: () => new Promise<void>(() => {}) },
+      ],
+      readinessTimeoutMs: 10,
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    const checks = (r.body as { checks: { name: string; ok: boolean }[] }).checks;
+    expect(checks).toEqual([{ name: "slow", ok: false }]);
+  });
+
+  it("returns 200 with no checks configured", async () => {
+    const r = await svc().route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(200);
+  });
+
+  it("returns 503 while draining even if all checks pass", async () => {
+    const s = svc({
+      readinessChecks: [{ name: "db", check: async () => {} }],
+    });
+    await s.drain();
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    expect(r.status).toBe(503);
+    expect((r.body as { status: string }).status).toBe("draining");
+  });
+
+  it("is public and unmetered (rate limit does not apply)", async () => {
+    const s = svc({
+      rateLimit: { capacity: 0, refillPerSec: 0 }, // would 429 everything if metered
+    });
+    const r = await s.route({ method: "GET", path: "/readyz" });
+    // Should be 200, not 429
+    expect(r.status).toBe(200);
+  });
+
+  it("/healthz is unaffected by draining", async () => {
+    const s = svc();
+    await s.drain();
+    const r = await s.route({ method: "GET", path: "/healthz" });
+    expect(r.status).toBe(200);
+    expect((r.body as { status: string }).status).toBe("ok");
+  });
+});
+
+describe("service: drain()", () => {
+  it("new POST /payments return 503 draining after drain() is called", async () => {
+    const s = svc();
+    await s.drain();
+    const r = await s.route({ method: "POST", path: "/payments", body: intentBody() });
+    expect(r.status).toBe(503);
+    expect((r.body as { error: string }).error).toBe("draining");
+  });
+
+  it("in-flight execute() completes after drain() is called", async () => {
+    const s = createService({
+      corridors: new Map([["test", corridor()]]),
+      deps: {
+        ...deps(),
+        // Fast adapter — no real sleep needed; just verifies tracking logic
+        sleep: async () => {},
+      },
+    });
+
+    // Start a payment
+    const paymentPromise = s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("inflight-1"),
+    });
+
+    // Call drain while payment is still running
+    const drainPromise = s.drain();
+
+    // New payments should be rejected
+    const blockedR = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("inflight-2"),
+    });
+    expect(blockedR.status).toBe(503);
+
+    // Original payment still finishes
+    const result = await paymentPromise;
+    expect(result.status).toBe(200);
+
+    // drain() resolves once in-flight work is done
+    await drainPromise;
+
+    // Nothing is left running, so a grace-timer log would list no keys.
+    expect(s.inFlightKeys()).toEqual([]);
+  });
+
+  it("drain() resolves immediately when no payments are in-flight", async () => {
+    const s = svc();
+    // No payments started — drain should resolve right away
+    await expect(s.drain()).resolves.toBeUndefined();
+  });
+});
+
+describe("service: storeCheck helper", () => {
+  it("passes when ping resolves", async () => {
+    const check = storeCheck({ ping: async () => {} });
+    expect(check.name).toBe("store");
+    await expect(check.check()).resolves.toBeUndefined();
+  });
+
+  it("throws when ping rejects", async () => {
+    const check = storeCheck(
+      {
+        ping: async () => {
+          throw new Error("db down");
+        },
+      },
+      "pg",
+    );
+    expect(check.name).toBe("pg");
+    await expect(check.check()).rejects.toThrow("db down");
+  });
+});
+
+// --- request-id correlation ------------------------------------------------
+// A 500 at the edge is worthless on its own: without an id there is nothing to
+// grep for in the log or the audit trail. These pin the round trip — the id the
+// caller gets back is the id every line behind it was written under.
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** Every line the engine logs, captured with its fields. */
+function captureLogger(): {
+  logger: Logger;
+  lines: { msg: string; fields: Record<string, unknown> }[];
+} {
+  const lines: { msg: string; fields: Record<string, unknown> }[] = [];
+  return {
+    lines,
+    logger: {
+      log: (_level, msg, fields) => {
+        lines.push({ msg, fields: { ...(fields ?? {}) } });
+      },
+    },
+  };
+}
+
+/** One request over a real socket, with the response headers kept readable. */
+function call(
+  port: number,
+  method: string,
+  path: string,
+  opts: { body?: string; headers?: Record<string, string> } = {},
+): Promise<{
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { host: "127.0.0.1", port, method, path, headers: opts.headers, agent: false },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () =>
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: data }),
+        );
+      },
+    );
+    req.on("error", reject);
+    req.end(opts.body);
+  });
+}
+
+describe("service: X-Request-Id propagation", () => {
+  it("mints a request id and echoes it when the caller sent none", async () => {
+    const r = await svc().route({ method: "GET", path: "/healthz" });
+    const id = r.headers?.["x-request-id"];
+    expect(id).toMatch(UUID_V4);
+  });
+
+  it("echoes a valid inbound id verbatim", async () => {
+    const inbound = "job.2026-01_A-99";
+    const r = await svc().route({
+      method: "GET",
+      path: "/healthz",
+      headers: { "x-request-id": inbound },
+    });
+    expect(r.headers?.["x-request-id"]).toBe(inbound);
+  });
+
+  it("replaces an inbound id that is too long or has the wrong charset", async () => {
+    for (const inbound of ["has space", "x".repeat(129), "drop\r\nInjected: 1", ""]) {
+      const r = await svc().route({
+        method: "GET",
+        path: "/healthz",
+        headers: { "x-request-id": inbound },
+      });
+      const id = r.headers?.["x-request-id"];
+      expect(id).not.toBe(inbound);
+      expect(id).toMatch(UUID_V4);
+    }
+  });
+
+  it("echoes the id even on a rejected request (401) and an unknown path (404)", async () => {
+    const guarded = svc({ apiKeys: new Set(["k1"]) });
+    const unauth = await guarded.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody(),
+    });
+    expect(unauth.status).toBe(401);
+    expect(unauth.headers?.["x-request-id"]).toMatch(UUID_V4);
+
+    const missing = await svc().route({
+      method: "GET",
+      path: "/nope",
+      headers: { "x-request-id": "trace-me-1" },
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.headers?.["x-request-id"]).toBe("trace-me-1");
+  });
+
+  it("stamps the request id on every engine log line and audit entry the payment produced", async () => {
+    const audit = new InMemoryAuditLog();
+    const { logger, lines } = captureLogger();
+    const s = svc({ deps: { ...deps(), logger, audit } });
+
+    const r = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("rid-run"),
+      headers: { "x-request-id": "rid-run" },
+    });
+    expect(r.status).toBe(200);
+    expect(r.headers?.["x-request-id"]).toBe("rid-run");
+
+    // Nothing is logged without the id, and nothing carries a different one.
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line.fields.requestId).toBe("rid-run");
+    }
+    expect(audit.entries.length).toBeGreaterThan(0);
+    for (const entry of audit.entries) {
+      expect(entry.requestId).toBe("rid-run");
+    }
+    expect(audit.details.length).toBeGreaterThan(0);
+    for (const detail of audit.details) {
+      expect(detail.requestId).toBe("rid-run");
+    }
+  });
+
+  it("passes a well-formed traceparent through, and drops a malformed one", async () => {
+    const audit = new InMemoryAuditLog();
+    const { logger, lines } = captureLogger();
+    const s = svc({ deps: { ...deps(), logger, audit } });
+    const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    const ok = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("rid-trace"),
+      headers: { "x-request-id": "rid-trace", traceparent },
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.headers?.traceparent).toBe(traceparent);
+    expect(lines.some((l) => l.fields.traceparent === traceparent)).toBe(true);
+    expect(audit.entries.every((e) => e.traceparent === traceparent)).toBe(true);
+
+    const bad = await s.route({
+      method: "GET",
+      path: "/healthz",
+      headers: { traceparent: "00-not-a-trace-id-00f067aa0ba902b7-01" },
+    });
+    expect(bad.headers?.traceparent).toBeUndefined();
+    expect(bad.headers?.["x-request-id"]).toMatch(UUID_V4);
+  });
+
+  it("sends the id back over the socket, including on the transport's own errors", async () => {
+    const s = svc({ maxBodyBytes: 64 });
+    const srv = s.server();
+    srv.listen(0);
+    await once(srv, "listening");
+    const { port } = srv.address() as AddressInfo;
+    try {
+      // A route-level response carries it...
+      const health = await call(port, "GET", "/healthz", {
+        headers: { "x-request-id": "sock-1" },
+      });
+      expect(health.status).toBe(200);
+      expect(health.headers["x-request-id"]).toBe("sock-1");
+
+      // ...and so does one the transport answers itself, before routing.
+      const junk = await call(port, "POST", "/payments", {
+        body: "{not json",
+        headers: { "x-request-id": "sock-2", "content-type": "application/json" },
+      });
+      expect(junk.status).toBe(400);
+      expect(junk.headers["x-request-id"]).toBe("sock-2");
+      expect(JSON.parse(junk.body)).toEqual({ error: "invalid JSON" });
+
+      // And on the 413 that never touches the router at all.
+      const huge = await call(port, "POST", "/payments", {
+        body: JSON.stringify({ blob: "x".repeat(500) }),
+        headers: { "x-request-id": "sock-3", "content-type": "application/json" },
+      });
+      expect(huge.status).toBe(413);
+      expect(huge.headers["x-request-id"]).toBe("sock-3");
+    } finally {
+      await gracefulShutdown(srv, s, { graceMs: 200 });
     }
   });
 });
