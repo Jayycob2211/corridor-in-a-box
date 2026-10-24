@@ -5,7 +5,11 @@ import {
   createMockSourceAdapter,
   type OpenTransaction,
 } from "@corridor/adapter-kit";
-import { StaticRouteResolver } from "@corridor/router";
+import {
+  StaticRouteResolver,
+  UnattestedAnchorError,
+  type RouteResolver,
+} from "@corridor/router";
 import { amountRangeCheck } from "@corridor/sep31";
 import {
   defaultSep31Gate,
@@ -883,6 +887,86 @@ describe("engine crash resume states", () => {
       expect(r.ok).toBe(true);
       expect((await store.get(key))?.state).toBe("completed");
     });
+  });
+});
+
+describe("engine route refusal (#257)", () => {
+  // The registry resolver fails closed by throwing; any resolver may.
+  const refusing: RouteResolver = {
+    async resolve() {
+      throw new UnattestedAnchorError("d.example", "no attestation on file");
+    },
+  };
+
+  it("fails a fresh run instead of stranding it in created, with an audit entry", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const audit = new InMemoryAuditLog();
+    const d = { ...deps(), idempotency: store, audit, resolver: refusing };
+
+    const r = await execute(intent("refused"), corridor(), d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("ROUTE_REFUSED");
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain("refusing to route through d.example");
+    }
+    const stored = await store.get("refused");
+    expect(stored?.state).toBe("failed");
+    expect(stored?.lastError).toMatch(/^ROUTE_REFUSED: /);
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]).toMatchObject({
+      idempotencyKey: "refused",
+      from: "created",
+      to: "failed",
+      error: expect.stringMatching(/^ROUTE_REFUSED: /),
+    });
+
+    // The key is spent, and says so, rather than reporting a run still in flight.
+    const again = await execute(intent("refused"), corridor(), d);
+    expect(again.ok).toBe(false);
+    if (!again.ok) {
+      expect(again.error.code).toBe("IDEMPOTENCY_CONFLICT");
+      expect(again.error.message).toContain("state=failed");
+    }
+  });
+
+  it("leaves a settled run untouched and resumable on resume", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const audit = new InMemoryAuditLog();
+    const key = "refused-resume-settled";
+    await store.put(resumableRun("settled", key));
+    const before = await store.get(key);
+
+    const r = await execute(intent(key), corridor(), {
+      ...deps(),
+      idempotency: store,
+      audit,
+      resolver: refusing,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("ROUTE_REFUSED");
+    expect(await store.get(key)).toEqual(before);
+    expect(audit.entries).toHaveLength(0);
+
+    // Once a route is available again, the same key reconciles to completion.
+    const resumed = await execute(intent(key), corridor(), { ...deps(), idempotency: store });
+    expect(resumed.ok).toBe(true);
+    expect((await store.get(key))?.state).toBe("completed");
+  });
+
+  it("fails a run resumed from created, which moved no money", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const key = "refused-resume-created";
+    await store.put({ ...resumableRun("created", key), transactionId: undefined });
+
+    const r = await execute(intent(key), corridor(), {
+      ...deps(),
+      idempotency: store,
+      resolver: refusing,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("ROUTE_REFUSED");
+    expect((await store.get(key))?.state).toBe("failed");
   });
 });
 

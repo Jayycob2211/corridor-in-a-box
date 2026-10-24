@@ -6,7 +6,7 @@
 // bespoke integrations implement this same interface and (in the real product)
 // could be implemented separately; no private implementation is included here.
 
-import type { Corridor } from "@corridor/manifest";
+import type { ComplianceMethod, Corridor } from "@corridor/manifest";
 import {
   applyPrice,
   compareAmounts,
@@ -23,6 +23,8 @@ import {
 
 export { type SettlementRef, settlementId };
 export { Sep10Client, jwtExpiryMs, type Sep10Signer } from "./sep10";
+export { Sep12ComplianceCheck, type Sep12ComplianceCheckOptions } from "./sep12";
+export type { ComplianceMethod };
 
 /** A SEP-38 quote. `firm` quotes carry an id + expiry and bind the deliverer to a rate. */
 export interface Quote {
@@ -300,7 +302,8 @@ export interface RefundRef {
 export interface AdapterCapabilities {
   readonly protocol: string;
   readonly quotes: readonly ("sep38_firm" | "sep38_indicative" | "native" | "none")[];
-  readonly kyc: "sep12" | "sep6_fields" | "bespoke" | "none";
+  /** Same vocabulary as the manifest's `compliance.method`. */
+  readonly kyc: ComplianceMethod;
   readonly settlement: readonly DepositInstructions["kind"][];
   readonly refunds: "request" | "report_only" | "none";
   readonly callbacks: boolean;
