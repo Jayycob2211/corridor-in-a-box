@@ -16,7 +16,7 @@ import {
   type Outcome,
   type PaymentIntent,
 } from "@corridor/types";
-import type { RouteResolver } from "@corridor/router";
+import type { RouteDecision, RouteResolver } from "@corridor/router";
 import {
   AdapterQuoteProvider,
   ExternalQuoteProvider,
@@ -474,7 +474,13 @@ export async function execute(
   }
 
   // --- pick the receiving anchor ---------------------------------------
-  const route = await deps.resolver.resolve(intent, corridor);
+  // The key is already claimed, so a refusal must still finish the run: left in
+  // `created` it would answer every retry with IDEMPOTENCY_CONFLICT forever.
+  const routed = await resolveRoute(deps.resolver, intent, corridor);
+  if (!routed.ok) {
+    return failRun({ run, trail, deps, store, now, recordOutcome }, routed.error);
+  }
+  const route = routed.value;
   const routeTrust = route.trust;
   const adapter = route.receiving;
   const context = createRunContext({
@@ -1015,26 +1021,7 @@ function createRunContext(init: RunContextInit): RunContext {
     return ok(undefined);
   };
 
-  const die: RunContext["die"] = async (error, checks) => {
-    if (!canTransition(run.state, "failed")) return { ok: false, error };
-    const from = run.state;
-    run.lastError = `${error.code}: ${error.message}`;
-    run.state = "failed";
-    run.version += 1;
-    trail.push("failed");
-    await store.put(run);
-    await emitTransition(
-      deps,
-      run,
-      from,
-      now(),
-      run.lastError,
-      routeTrust,
-      checks ? { checks } : undefined,
-    );
-    await recordOutcome("failed", error);
-    return { ok: false, error };
-  };
+  const die: RunContext["die"] = (error, checks) => failRun(init, error, checks);
 
   const holdAndStop: RunContext["holdAndStop"] = async (
     error,
@@ -1166,6 +1153,62 @@ function createRunContext(init: RunContextInit): RunContext {
   };
 
   return { advance, die, finishFailure, holdAndStop, recordOutcome };
+}
+
+/**
+ * Move a run to `failed`, persist it and audit the transition: the body of
+ * `die`. Standalone so a run whose route was refused, which has no adapter and
+ * so no run context, takes exactly the same path.
+ */
+async function failRun(
+  init: Pick<
+    RunContextInit,
+    "run" | "trail" | "deps" | "store" | "now" | "routeTrust" | "recordOutcome"
+  >,
+  error: CorridorError,
+  checks?: readonly CheckResult[],
+): Promise<Err> {
+  const { run, trail, deps, store, now, routeTrust, recordOutcome } = init;
+  if (!canTransition(run.state, "failed")) return { ok: false, error };
+  const from = run.state;
+  run.lastError = `${error.code}: ${error.message}`;
+  run.state = "failed";
+  run.version += 1;
+  trail.push("failed");
+  await store.put(run);
+  await emitTransition(
+    deps,
+    run,
+    from,
+    now(),
+    run.lastError,
+    routeTrust,
+    checks ? { checks } : undefined,
+  );
+  await recordOutcome("failed", error);
+  return { ok: false, error };
+}
+
+/**
+ * Ask the resolver for a route, turning a throw into ROUTE_REFUSED. Resolvers
+ * fail closed by throwing (`UnattestedAnchorError`), and a third-party one may
+ * throw for any reason; either way the engine must still own the run's state.
+ * Not retryable: the same payment would be refused the same way.
+ */
+async function resolveRoute(
+  resolver: RouteResolver,
+  intent: PaymentIntent,
+  corridor: Corridor,
+): Promise<Outcome<RouteDecision>> {
+  try {
+    return ok(await resolver.resolve(intent, corridor));
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return fail("ROUTE_REFUSED", `route resolver refused corridor ${corridor.id}: ${reason}`, {
+      retryable: false,
+      cause,
+    });
+  }
 }
 
 function toResult(run: StoredRun, trail: readonly CorridorState[]): RunResult {
@@ -1304,7 +1347,18 @@ async function resumeRun(
       `idempotencyKey ${run.idempotencyKey} cannot resume state=${run.state}: ${detail}`,
     );
 
-  const route = await deps.resolver.resolve(intent, corridor);
+  const routed = await resolveRoute(deps.resolver, intent, corridor);
+  if (!routed.ok) {
+    // A run that stopped before opening a receiving transaction moved no money
+    // and would be failed as RESUME_STALE below anyway, so fail it now. Any
+    // later state may have money on the chain or in flight (a `settled` run
+    // still has to reconcile): leave the stored row untouched and resumable.
+    if (run.state === "created" || run.state === "quoted" || run.state === "compliant") {
+      return failRun({ run, trail, deps, store, now, recordOutcome }, routed.error);
+    }
+    return routed;
+  }
+  const route = routed.value;
   const context = createRunContext({
     run,
     trail,
