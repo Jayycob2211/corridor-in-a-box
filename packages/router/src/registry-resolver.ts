@@ -99,10 +99,6 @@ export function isUnattestedDomainAllowed(
 }
 
 export class UnattestedAnchorError extends Error {
-  /** Stable machine-readable code the engine maps to a CorridorErrorCode. */
-  readonly code = "ROUTE_REFUSED" as const;
-  /** A refused route will not succeed on retry without operator action. */
-  readonly retryable = false as const;
   constructor(
     readonly domain: string,
     readonly reason: string,

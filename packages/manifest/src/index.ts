@@ -180,10 +180,35 @@ export const FxSchema = z
     }
   });
 
+/**
+ * How a corridor's receiving-side KYC is performed. The same vocabulary as
+ * `AdapterCapabilities.kyc`, so a manifest and an adapter cannot drift apart.
+ *  - `sep12`:       the receiver is registered via SEP-12 and its status read
+ *                   with `GET /customer` against the dest's `kyc_server`.
+ *  - `sep6_fields`: KYC travels inline on the SEP-6 request. The engine carries
+ *                   field NAMES and operator-supplied references, never raw PII.
+ *  - `bespoke`:     anchor-specific onboarding; the engine only carries the
+ *                   anchor's customer reference (`PartyRef.anchorCustomerId`).
+ *  - `none`:        no per-customer KYC at the receiver.
+ */
+export const COMPLIANCE_METHODS = ["sep12", "sep6_fields", "bespoke", "none"] as const;
+export type ComplianceMethod = (typeof COMPLIANCE_METHODS)[number];
+
 export const ComplianceSchema = z.object({
   source_jurisdiction: z.string().min(1),
   dest_jurisdiction: z.string().min(1),
   travel_rule_profile: z.string().default("default"),
+  /**
+   * How the receiver's KYC is done (#193). Optional, and deliberately NOT
+   * filled in at parse time: a parse-time default would change `hashCorridor`
+   * for every existing manifest and refuse to resume their in-flight runs.
+   * Read it through `complianceMethod()`, which derives the default — `sep12`
+   * when the dest has a `kyc_server`, else `none`.
+   *
+   * An explicit value is a claim the engine checks against the adapter's
+   * `capabilities().kyc` before any money moves; a mismatch fails closed.
+   */
+  method: z.enum(COMPLIANCE_METHODS).optional(),
   /**
    * SEP-12 customer `type` for the receiving party.
    *
@@ -315,19 +340,56 @@ export const ProofSchema = z.object({
     .optional(),
 });
 
-export const CorridorSchema = z.object({
-  id: z.string().min(1),
-  /** Human note. Use it to record liveness, e.g. "pending: no RMB SEP-31 anchor". */
-  status_note: z.string().optional(),
-  source: SourceAnchorSchema,
-  dest: DestSchema,
-  fx: FxSchema,
-  compliance: ComplianceSchema,
-  settlement: SettlementSchema,
-  recovery: RecoverySchema,
-  limits: LimitsSchema.optional(),
-  proof: ProofSchema.optional(),
-});
+export const CorridorSchema = z
+  .object({
+    id: z.string().min(1),
+    /** Human note. Use it to record liveness, e.g. "pending: no RMB SEP-31 anchor". */
+    status_note: z.string().optional(),
+    source: SourceAnchorSchema,
+    dest: DestSchema,
+    fx: FxSchema,
+    compliance: ComplianceSchema,
+    settlement: SettlementSchema,
+    recovery: RecoverySchema,
+    limits: LimitsSchema.optional(),
+    proof: ProofSchema.optional(),
+  })
+  .superRefine((c, ctx) => {
+    // `compliance.method` needs dest context ComplianceSchema cannot see. Refuse
+    // the combinations that could never run rather than let them fail later.
+    const method = c.compliance.method;
+    if (method === "sep12" && !hasKycServer(c.dest)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["compliance", "method"],
+        message: 'compliance.method "sep12" requires dest.endpoints.kyc_server',
+      });
+    }
+    if (method === "sep6_fields" && c.dest.protocol !== "sep6") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["compliance", "method"],
+        message: `compliance.method "sep6_fields" requires dest.protocol "sep6", got "${c.dest.protocol}"`,
+      });
+    }
+  });
+
+function hasKycServer(dest: z.infer<typeof DestSchema>): boolean {
+  return "kyc_server" in dest.endpoints && Boolean(dest.endpoints.kyc_server);
+}
+
+/**
+ * The corridor's compliance method: the explicit `compliance.method` when set,
+ * otherwise `sep12` when the dest exposes a `kyc_server` and `none` when it
+ * does not — the same answer `Sep31Adapter.capabilities().kyc` gives.
+ *
+ * The adapter stays authoritative for what it actually enforces: a derived
+ * `none` never switches off a check an adapter performs (the SEP-6 adapter,
+ * for one, still refuses a dest with no `kyc_server`).
+ */
+export function complianceMethod(corridor: Corridor): ComplianceMethod {
+  return corridor.compliance.method ?? (hasKycServer(corridor.dest) ? "sep12" : "none");
+}
 
 export type Corridor = z.infer<typeof CorridorSchema>;
 export type DestProtocol = "sep31" | "sep6" | `custom:${string}`;

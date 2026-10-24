@@ -4,7 +4,7 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
-import { StaticRouteResolver } from "@corridor/router";
+import { StaticRouteResolver, UnattestedAnchorError } from "@corridor/router";
 import {
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
@@ -200,6 +200,11 @@ describe("service: strict payment body validation", () => {
       field: "recipient.sep12Id",
     },
     {
+      name: "a non-string recipient.anchorCustomerId",
+      body: { ...full(), recipient: { id: "r", anchorCustomerId: 7 } },
+      field: "recipient.anchorCustomerId",
+    },
+    {
       name: "a non-string recipient.id",
       body: { ...full(), recipient: { id: null } },
       field: "recipient.id",
@@ -278,6 +283,18 @@ describe("service: strict payment body validation", () => {
     expect(out.field).toBe("sourceAmount.asset");
   });
 
+  it("accepts recipient.anchorCustomerId alongside the deprecated sep12Id", async () => {
+    const r = await svc().route({
+      method: "POST",
+      path: "/payments",
+      body: {
+        ...intentBody("party-ref-ok"),
+        recipient: { id: "r", sep12Id: "legacy-1", anchorCustomerId: "neutral-1" },
+      },
+    });
+    expect(r.status).toBe(200);
+  });
+
   it("still accepts a well-formed body end to end", async () => {
     const r = await svc().route({
       method: "POST",
@@ -292,22 +309,29 @@ describe("service: strict payment body validation", () => {
   });
 });
 
-describe("service: refused route status", () => {
-  it("returns a non-500 status for a route refused by the resolver", async () => {
-    const s = createService({
-      corridors: new Map([["test", corridor()]]),
+describe("service: refused route", () => {
+  it("answers 503 ROUTE_REFUSED and records the run as failed", async () => {
+    const s = svc({
       deps: {
         ...deps(),
         resolver: {
-          resolve: () => {
-            throw new Error("UnattestedAnchorError: refused");
+          async resolve() {
+            throw new UnattestedAnchorError("d.example", "no attestation on file");
           },
-        } as unknown as EngineDeps["resolver"],
+        },
       },
     });
-    const r = await s.route({ method: "POST", path: "/payments", body: intentBody("refused") });
-    expect(r.status).not.toBe(500);
+    const r = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("refused"),
+    });
     expect(r.status).toBe(503);
+    expect((r.body as { error: string }).error).toBe("ROUTE_REFUSED");
+
+    const run = await s.route({ method: "GET", path: "/payments/refused" });
+    expect(run.status).toBe(200);
+    expect((run.body as { state: string }).state).toBe("failed");
   });
 });
 
@@ -356,8 +380,40 @@ describe("service: body-size limit (HTTP server)", () => {
   it("rejects a body over the cap with 413 (declared Content-Length)", async () => {
     const { port, close } = await listen(svc({ maxBodyBytes: 64 }).server());
     try {
-      const r = await post(port, "x".repeat(200), { "content-type": "application/json" });
-      expect(r.status).toBe(413);
+      const big = JSON.stringify({ blob: "x".repeat(500) });
+      const res = await post(port, big, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(big)),
+      });
+      expect(res.status).toBe(413);
+    } finally {
+      close();
+    }
+  });
+
+  it("rejects an oversized streamed body with 413 (no/short Content-Length)", async () => {
+    const { port, close } = await listen(svc({ maxBodyBytes: 64 }).server());
+    try {
+      // Chunked transfer: the server can't trust a declared length and must cap
+      // the bytes it actually buffers.
+      const res = await post(port, JSON.stringify({ blob: "x".repeat(500) }), {
+        "content-type": "application/json",
+        "transfer-encoding": "chunked",
+      });
+      expect(res.status).toBe(413);
+    } finally {
+      close();
+    }
+  });
+
+  it("still serves a normal payment under the cap", async () => {
+    const { port, close } = await listen(svc().server());
+    try {
+      const res = await post(port, JSON.stringify(intentBody("http-ok")), {
+        "content-type": "application/json",
+      });
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body).state).toBe("completed");
     } finally {
       close();
     }

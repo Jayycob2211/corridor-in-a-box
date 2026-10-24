@@ -7,6 +7,7 @@ import {
   hashCorridor,
   manifestHash,
   canonicalJson,
+  complianceMethod,
 } from "@corridor/manifest";
 
 const valid = {
@@ -439,6 +440,66 @@ describe("manifest", () => {
         expect(live.warnings.some((w) => w.includes("fx.quote_source=sep38"))).toBe(true);
       }
     });
+  });
+});
+
+describe("compliance.method (#193)", () => {
+  const withDest = (
+    endpoints: Record<string, string>,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    ...valid,
+    dest: { ...valid.dest, endpoints: { ...valid.dest.endpoints, ...endpoints } },
+    ...extra,
+  });
+
+  it("defaults to sep12 when the dest has a kyc_server", () => {
+    const r = parseCorridor(withDest({ kyc_server: "https://d.example/sep12" }));
+    expect(r.ok && complianceMethod(r.value)).toBe("sep12");
+  });
+
+  it("defaults to none when the dest has no kyc_server", () => {
+    const r = parseCorridor(valid);
+    expect(r.ok && complianceMethod(r.value)).toBe("none");
+  });
+
+  it("is derived, not written into the parsed manifest, so existing hashes are unchanged", () => {
+    const r = parseCorridor(withDest({ kyc_server: "https://d.example/sep12" }));
+    expect(r.ok && r.value.compliance.method).toBeUndefined();
+  });
+
+  it("honours an explicit method over the derived default", () => {
+    const r = parseCorridor(
+      withDest(
+        { kyc_server: "https://d.example/sep12" },
+        { compliance: { ...valid.compliance, method: "bespoke" } },
+      ),
+    );
+    expect(r.ok && complianceMethod(r.value)).toBe("bespoke");
+  });
+
+  it("rejects an unknown method", () => {
+    const r = parseCorridor({
+      ...valid,
+      compliance: { ...valid.compliance, method: "email" },
+    });
+    expect(!r.ok && r.error.code).toBe("MANIFEST_INVALID");
+  });
+
+  it("rejects sep12 on a dest with no kyc_server", () => {
+    const r = parseCorridor({
+      ...valid,
+      compliance: { ...valid.compliance, method: "sep12" },
+    });
+    expect(!r.ok && r.error.message).toContain("requires dest.endpoints.kyc_server");
+  });
+
+  it("rejects sep6_fields on a non-SEP-6 dest", () => {
+    const r = parseCorridor({
+      ...valid,
+      compliance: { ...valid.compliance, method: "sep6_fields" },
+    });
+    expect(!r.ok && r.error.message).toContain('requires dest.protocol "sep6"');
   });
 });
 
